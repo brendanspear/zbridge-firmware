@@ -1,0 +1,510 @@
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+index 7013585..05d2cdb 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+@@ -22,0 +23 @@
++#include "ZBridge.h"
+@@ -630,0 +632,5 @@ void platform_late_init()
++#if defined(ZBRIDGE_NATIVE_DIAGNOSTIC) || defined(ZBRIDGE_DIRECT_RAM_MODE)
++    // Diagnostic build: boot through the platform's real initiator branch so
++    // ZBridge can distinguish a live role-handoff bug from a PHY limitation.
++    g_scsi_initiator = true;
++#endif
+@@ -1066,0 +1073 @@ uint32_t platform_write_to_serial(uint8_t* data, uint32_t len)
++    if (zbridge_binary_active()) return 0;
+@@ -1087,0 +1095 @@ static void usb_log_poll()
++    if (zbridge_binary_active()) return;
+@@ -1457,0 +1466,6 @@ void platform_reset_mcu(uint32_t reset_in_ms)
++void platform_enter_bootloader(void)
++{
++    g_uf2_mode = true;
++    platform_reset_mcu(0);
++}
++
+@@ -1832,0 +1847 @@ static usb_input_type_t serial_menu(menu_context_t context)
++    if (zbridge_poll()) return USB_INPUT_NONE;
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.h b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.h
+index 8c6872e..795e30f 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.h
++++ b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.h
+@@ -141,0 +142 @@ void platform_reset_mcu(uint32_t reset_in_ms);
++void platform_enter_bootloader(void);
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+index 57faa52..229cf28 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+@@ -35,0 +36,3 @@ int g_scsiHostBusWidth;
++uint8_t g_scsiHostPhySelectionStage;
++uint32_t g_scsiHostPhySelectionSignals;
++static bool g_scsiHostPhySawRequest;
+@@ -42 +45,5 @@ void scsiHostPhyReset(void) {}
+-bool scsiHostPhySelect(int target_id) { return false; }
++void scsiHostPhyActivateNoReset(void) {}
++void scsiHostPhyDeactivate(void) {}
++bool scsiHostPhySelect(int target_id, uint8_t initiator_id, bool request_atn) { return false; }
++uint32_t scsiHostPhyGetSignals(void) { return 0; }
++uint32_t scsiHostPhyGetGPIOState(void) { return 0; }
+@@ -65,0 +73,77 @@ void scsiHostPhyReset(void)
++void scsiHostPhyActivateNoReset(void)
++{
++    SCSI_RELEASE_OUTPUTS();
++
++    // A live ZBridge role handoff starts from target-mode GPIO settings.
++    // Recreate the pin configuration used by a Blaster that booted directly
++    // in initiator mode; changing OE bits alone leaves ACK/ATN with target-mode
++    // slew and several phase inputs without the initiator pull configuration.
++    const uint input_pins[] = {
++        SCSI_IN_IO, SCSI_IN_MSG, SCSI_IN_CD, SCSI_IN_REQ,
++        SCSI_IN_BSY, SCSI_IN_RST
++    };
++    for (uint pin : input_pins)
++    {
++        gpio_set_function(pin, GPIO_FUNC_SIO);
++        gpio_set_pulls(pin, true, false);
++        gpio_set_dir(pin, GPIO_IN);
++        gpio_set_slew_rate(pin, GPIO_SLEW_RATE_SLOW);
++    }
++
++    const uint output_pins[] = {
++        SCSI_OUT_RST, SCSI_OUT_SEL, SCSI_OUT_ACK, SCSI_OUT_ATN
++    };
++    for (uint pin : output_pins)
++    {
++        gpio_set_function(pin, GPIO_FUNC_SIO);
++        gpio_set_pulls(pin, false, false);
++        gpio_put(pin, 1); // SCSI controls are active low.
++        gpio_set_dir(pin, GPIO_OUT);
++        gpio_set_slew_rate(pin, GPIO_SLEW_RATE_FAST);
++    }
++
++    SCSI_ENABLE_INITIATOR();
++    scsi_accel_host_init();
++    g_scsiHostPhyReset = false;
++}
++
++void scsiHostPhyDeactivate(void)
++{
++    SCSI_RELEASE_OUTPUTS();
++    gpio_set_dir(SCSI_OUT_ACK, GPIO_IN);
++    gpio_set_dir(SCSI_OUT_ATN, GPIO_IN);
++}
++
++uint32_t scsiHostPhyGetSignals(void)
++{
++    uint32_t signals = 0;
++    if (SCSI_IN(BSY)) signals |= 1u << 0;
++    if (SCSI_IN(SEL)) signals |= 1u << 1;
++    if (SCSI_IN(REQ)) signals |= 1u << 2;
++    if (SCSI_IN(CD))  signals |= 1u << 3;
++    if (SCSI_IN(IO))  signals |= 1u << 4;
++    if (SCSI_IN(MSG)) signals |= 1u << 5;
++    if (SCSI_IN(ATN)) signals |= 1u << 6;
++    signals |= (SCSI_IN_DATA() & 0xFFu) << 8;
++    return signals;
++}
++
++uint32_t scsiHostPhyGetGPIOState(void)
++{
++    const uint pins[] = {
++        SCSI_IN_REQ, SCSI_IN_CD, SCSI_IN_MSG, SCSI_IN_IO,
++        SCSI_IN_ATN, SCSI_IN_ACK, SCSI_OUT_SEL, SCSI_OUT_BSY, SCSI_OUT_RST
++    };
++    uint32_t directions = 0;
++    uint32_t inputs = 0;
++    uint32_t outputs = 0;
++    for (uint bit = 0; bit < sizeof(pins) / sizeof(pins[0]); ++bit)
++    {
++        const uint pin = pins[bit];
++        if (gpio_get_dir(pin) == GPIO_OUT) directions |= 1u << bit;
++        if (gpio_get(pin)) inputs |= 1u << bit;
++        if (gpio_get_out_level(pin)) outputs |= 1u << bit;
++    }
++    return directions | (inputs << 9) | (outputs << 18);
++}
++
+@@ -68 +152 @@ void scsiHostPhyReset(void)
+-bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++bool scsiHostPhySelect(int target_id, uint8_t initiator_id, bool request_atn)
+@@ -69,0 +154,4 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++    g_scsiHostPhySelectionStage = 0;
++    g_scsiHostPhySelectionSignals = 0;
++    g_scsiHostPhySawRequest = false;
++
+@@ -73,6 +161,6 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-    // We can't write individual data bus bits, so use a bit modified
+-    // arbitration scheme. We always yield to any other initiator on
+-    // the bus.
+-    scsiLogInitiatorPhaseChange(BUS_BUSY);
+-    SCSI_OUT(BSY, 1);
+-    for (int wait = 0; wait < 10; wait++)
++    // Claim the first electrically free sample directly from this selection
++    // routine. The Akai continuously polls HD5; build 12's separate stability
++    // timer could expire even though its final raw sample showed BSY/SEL free.
++    uint32_t busFreeWaitStarted = millis();
++    uint32_t lastWatchdogReset = busFreeWaitStarted;
++    while (true)
+@@ -80,3 +168,5 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-        delayMicroseconds(1);
+-#ifdef ZULUSCSI_WIDE
+-        if (SCSI_IN_DATA() == 0)
++        // SCSI requires both lines to remain released for the bus-free delay,
++        // not merely to be observed free in one sample. This matters on the
++        // multi-initiator Akai bus, where ID 6 can begin another HD poll in the
++        // same interval that computer/initiator ID 7 is trying to arbitrate.
++        if (!SCSI_IN(BSY) && !SCSI_IN(SEL))
+@@ -84,2 +174,6 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-#else
+-        if (SCSI_IN_DATA() != 0)
++            delayMicroseconds(1); // >= 800 ns SCSI bus-free delay
++            if (!SCSI_IN(BSY) && !SCSI_IN(SEL)) break;
++        }
++
++        uint32_t now = millis();
++        if ((uint32_t)(now - busFreeWaitStarted) >= 5000)
+@@ -87,4 +181,2 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-#endif
+-            dbgmsg("scsiHostPhySelect: bus is busy");
+-            scsiLogInitiatorPhaseChange(BUS_FREE);
+-            SCSI_RELEASE_OUTPUTS();
++            g_scsiHostPhySelectionSignals = scsiHostPhyGetSignals();
++            dbgmsg("scsiHostPhySelect: bus never became free");
+@@ -92,0 +185,12 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++
++        // The Akai can immediately reselect its configured disk target after
++        // releasing the bus. platform_poll() is much longer than that free
++        // interval, so build 18 repeatedly slept through the only opportunity
++        // to arbitrate. Keep this loop time-critical and service only the MCU
++        // watchdog until we have claimed the bus.
++        if ((uint32_t)(now - lastWatchdogReset) >= 100)
++        {
++            platform_reset_watchdog();
++            lastWatchdogReset = now;
++        }
++        delayMicroseconds(1);
+@@ -95,11 +199,3 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-    // Selection phase
+-    scsiLogInitiatorPhaseChange(SELECTION);
+-    dbgmsg("------ SELECTING ", target_id, " with initiator ID ", (int)initiator_id);
+-    SCSI_OUT(SEL, 1);
+-    delayMicroseconds(5);
+-    SCSI_OUT_DATA((1 << target_id) | (1 << initiator_id));
+-    delayMicroseconds(5);
+-    SCSI_OUT(BSY, 0);
+-
+-    // Wait for target to respond
+-    for (int wait = 0; wait < 2500; wait++)
++    g_scsiHostPhySelectionStage = 1;
++
++    if (!request_atn)
+@@ -107,2 +203,7 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-        delayMicroseconds(100);
+-        if (SCSI_IN(BSY))
++        // Preserve the exact modified-arbitration sequence used by the
++        // upstream Blaster initiator implementation. The S3200XL processor
++        // acknowledges a target-only ID selection but does not subsequently
++        // assert REQ; it needs to see both processor ID 6 and computer ID 7.
++        scsiLogInitiatorPhaseChange(BUS_BUSY);
++        SCSI_OUT(BSY, 1);
++        for (int wait = 0; wait < 10; wait++)
+@@ -110 +211,11 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-            break;
++            delayMicroseconds(1);
++#ifdef ZULUSCSI_WIDE
++            if (SCSI_IN_DATA() == 0)
++#else
++            if (SCSI_IN_DATA() != 0)
++#endif
++            {
++                g_scsiHostPhySelectionSignals = scsiHostPhyGetSignals();
++                SCSI_RELEASE_OUTPUTS();
++                return false;
++            }
+@@ -111,0 +223,42 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++
++        scsiLogInitiatorPhaseChange(SELECTION);
++        dbgmsg("------ BLASTER SELECTING ", target_id,
++               " with initiator ID ", (int)initiator_id);
++        SCSI_OUT(SEL, 1);
++        delayMicroseconds(5);
++        SCSI_OUT_DATA((1 << target_id) | (1 << initiator_id));
++        delayMicroseconds(5);
++        g_scsiHostPhySelectionStage = 2;
++        SCSI_OUT(BSY, 0);
++    }
++    else
++    {
++        // Standards-style Macintosh/SCSI2Pi arbitration with ATN/IDENTIFY.
++        scsiLogInitiatorPhaseChange(BUS_BUSY);
++        SCSI_OUT_DATA(1 << initiator_id);
++        delayMicroseconds(1);
++        SCSI_OUT(BSY, 1);
++        delayMicroseconds(3); // >= 2.4 us SCSI arbitration delay
++
++        scsiLogInitiatorPhaseChange(SELECTION);
++        dbgmsg("------ SCSI-2 SELECTING ", target_id, " with initiator ID ", (int)initiator_id);
++        SCSI_OUT(SEL, 1);
++        delayMicroseconds(2); // bus-clear + bus-settle delays
++        SCSI_OUT_DATA((1 << target_id) | (1 << initiator_id));
++        delayMicroseconds(1);
++        SCSI_OUT(ATN, 1);
++        delayMicroseconds(1); // two deskew delays
++        g_scsiHostPhySelectionStage = 2;
++        SCSI_OUT(BSY, 0);
++        delayMicroseconds(1); // bus-settle delay
++    }
++
++    // Wait up to the standard 250 ms selection timeout, but sample at 1 us
++    // intervals. Once the target asserts BSY, the initiator must release its
++    // selection data and SEL promptly. Logging or 100 us polling here left the
++    // S3200XL waiting hundreds of microseconds and stranded it before COMMAND.
++    uint32_t selectionWaitStarted = micros();
++    while (!SCSI_IN(BSY) &&
++           (uint32_t)(micros() - selectionWaitStarted) < 250000)
++    {
++        delayMicroseconds(1);
+@@ -116,0 +270,3 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++        g_scsiHostPhySelectionSignals = scsiHostPhyGetSignals();
++        dbgmsg("ZBridge selection timeout stage ", (int)g_scsiHostPhySelectionStage,
++               " signals ", (uint32_t)g_scsiHostPhySelectionSignals);
+@@ -121 +277,6 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
+-    // We need to assert OUT_BSY to enable IO buffer U105 to read status signals.
++    g_scsiHostPhySelectionStage = 3;
++
++    // Preserve the exact Blaster handoff order from upstream initiator mode:
++    // release the selection IDs, enable U105's status inputs, then release
++    // SEL. On this board the control pins are multiplexed, so reordering these
++    // operations can lose the target's first REQ transition.
+@@ -124,0 +286 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
++    g_scsiHostPhySelectionStage = 4;
+@@ -154 +315,0 @@ int scsiHostPhyGetPhase()
+-    int phase = 0;
+@@ -155,0 +317,3 @@ int scsiHostPhyGetPhase()
++    if (req_in) g_scsiHostPhySawRequest = true;
++
++    int phase = 0;
+@@ -160 +324,7 @@ int scsiHostPhyGetPhase()
+-    if (phase == 0 && absolute_time_diff_us(last_online_time, get_absolute_time()) > 100)
++    // OUT_BSY enables the Blaster's status-input buffer after selection. Only
++    // release it to sample the target's real BSY when no target-driven phase
++    // lines are visible. Build 20 pulsed BSY whenever REQ was momentarily
++    // inactive, including while the Akai was establishing MESSAGE OUT or
++    // COMMAND, which caused the processor target to abandon the selection.
++    if (g_scsiHostPhySawRequest && !req_in && phase == 0 &&
++        absolute_time_diff_us(last_online_time, get_absolute_time()) > 100)
+@@ -183,2 +353,3 @@ int scsiHostPhyGetPhase()
+-        // Don't act on phase changes until target asserts request signal.
+-        // This filters out any spurious changes on control signals.
++        // The Blaster multiplexes selection and phase inputs. Before REQ, its
++        // MSG/BSY GPIO can contain the target's selection BSY state rather
++        // than a valid MSG phase. Only trust CD/IO/MSG after REQ is asserted.
+@@ -187,5 +358,3 @@ int scsiHostPhyGetPhase()
+-    else
+-    {
+-        scsiLogInitiatorPhaseChange(phase);
+-        return phase;
+-    }
++
++    scsiLogInitiatorPhaseChange(phase);
++    return phase;
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
+index 7652158..7d8aa3c 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
+@@ -31,0 +32,2 @@ extern volatile int g_scsiHostPhyReset;
++extern uint8_t g_scsiHostPhySelectionStage;
++extern uint32_t g_scsiHostPhySelectionSignals;
+@@ -34,0 +37,7 @@ void scsiHostPhyReset(void);
++void scsiHostPhyActivateNoReset(void);
++// Return the initiator-only ACK/ATN pins to inputs before target-mode restore.
++void scsiHostPhyDeactivate(void);
++
++// Wait until both BSY and SEL have remained inactive for stable_us.
++// This is required when changing from target mode to initiator mode on a
++// live multi-initiator bus.
+@@ -40 +49,10 @@ void scsiHostPhyReset(void);
+-bool scsiHostPhySelect(int target_id, uint8_t initiator_id);
++bool scsiHostPhySelect(int target_id, uint8_t initiator_id, bool request_atn);
++
++// Raw active-high signal snapshot for diagnostics. Bits 0..6 are
++// BSY, SEL, REQ, CD, IO, MSG and ATN; bits 8..15 contain the data bus.
++uint32_t scsiHostPhyGetSignals(void);
++
++// Compact Blaster GPIO snapshot for diagnostics. Bits 0..8 are pin
++// directions, 9..17 are pad inputs, and 18..26 are output-latch levels for
++// REQ, CD, MSG, IO, ATN, ACK, SEL, BSY and RST respectively.
++uint32_t scsiHostPhyGetGPIOState(void);
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.cpp
+index 0139ffe..b33a135 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.cpp
+@@ -194,0 +195,8 @@ extern "C" void scsiPhyReset(void)
++extern "C" void scsiPhyDisable(void)
++{
++    gpio_set_irq_enabled(SCSI_IN_BSY, GPIO_IRQ_EDGE_RISE, false);
++    gpio_set_irq_enabled(SCSI_IN_RST, GPIO_IRQ_EDGE_FALL, false);
++    gpio_set_irq_enabled(SCSI_IN_SEL, GPIO_IRQ_EDGE_FALL, false);
++    SCSI_RELEASE_OUTPUTS();
++}
++
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.h b/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.h
+index 702364a..26c0a5e 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.h
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiPhy.h
+@@ -56,0 +57 @@ void scsiPhyReset(void);
++void scsiPhyDisable(void);
+diff --git a/platformio.ini b/platformio.ini
+index 8bd8579..77a528f 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -202 +202,3 @@ build_flags =
+-    -DNETWORK_PACKET_QUEUE_SIZE=40
++    ; Reserve enough SRAM for ZBridge's framed USB buffer. DaynaPORT remains
++    ; enabled; only its burst queue depth is reduced for the Blaster build.
++    -DNETWORK_PACKET_QUEUE_SIZE=8
+@@ -210,0 +213,2 @@ build_flags =
++    -DZBRIDGE_DIRECT_RAM_MODE
++    -include src/tusb_config.h
+diff --git a/src/ZuluSCSI.cpp b/src/ZuluSCSI.cpp
+index 3756435..2972384 100644
+--- a/src/ZuluSCSI.cpp
++++ b/src/ZuluSCSI.cpp
+@@ -72,0 +73 @@
++#include "ZBridge.h"
+@@ -1139,0 +1141,7 @@ static void reinitSCSI()
++#ifdef ZBRIDGE_NATIVE_DIAGNOSTIC
++    // Capture the physical Blaster GPIO transitions around ZBridge's Akai
++    // selection attempt. The file is decoded after returning to normal
++    // combined target/direct mode.
++    platform_init_sniffer();
++#endif
++
+@@ -1748,0 +1757 @@ extern "C" void zuluscsi_main_loop(void)
++#if !defined(ZBRIDGE_NATIVE_DIAGNOSTIC) && !defined(ZBRIDGE_DIRECT_RAM_MODE)
+@@ -1750,0 +1760 @@ extern "C" void zuluscsi_main_loop(void)
++#endif
+@@ -1755,2 +1765,5 @@ extern "C" void zuluscsi_main_loop(void)
+-    scsiPoll();
+-    scsiDiskPoll();
++    if (!zbridge_target_quiesced())
++    {
++      scsiPoll();
++      scsiDiskPoll();
++    }
+diff --git a/src/ZuluSCSI_initiator.cpp b/src/ZuluSCSI_initiator.cpp
+index 62d3e24..89e4e4e 100644
+--- a/src/ZuluSCSI_initiator.cpp
++++ b/src/ZuluSCSI_initiator.cpp
+@@ -166,0 +167,6 @@ int scsiInitiatorGetOwnID()
++void scsiInitiatorSetOwnID(uint8_t initiator_id)
++{
++    g_initiator_state.initiator_id = initiator_id & 7;
++    memset(g_initiator_state.targetBusWidth, 0, sizeof(g_initiator_state.targetBusWidth));
++}
++
+@@ -757,0 +764,6 @@ void scsiInitiatorMainLoop()
++uint32_t g_scsiInitiatorTimeoutSignals = 0;
++int8_t g_scsiInitiatorTimeoutPhase = BUS_FREE;
++uint8_t g_scsiInitiatorTimeoutSelectionStage = 0;
++uint8_t g_scsiInitiatorPhaseHistory = 0;
++uint32_t g_scsiInitiatorTimeoutGPIOState = 0;
++
+@@ -762 +774,2 @@ int scsiInitiatorRunCommand(int target_id,
+-                            bool returnDataPhase, uint32_t timeout)
++                            bool returnDataPhase, uint32_t timeout,
++                            bool abortOnTimeout, bool requestIdentify)
+@@ -765 +778,11 @@ int scsiInitiatorRunCommand(int target_id,
+-    if (!scsiHostPhySelect(target_id, g_initiator_state.initiator_id))
++    g_scsiInitiatorTimeoutSignals = 0;
++    g_scsiInitiatorTimeoutPhase = BUS_FREE;
++    g_scsiInitiatorTimeoutSelectionStage = 0;
++    g_scsiInitiatorPhaseHistory = 0;
++    g_scsiInitiatorTimeoutGPIOState = 0;
++
++    // Akai processor targets follow the SCSI-2 initiator sequence used by
++    // MESA/SCSI2Pi: assert ATN during selection, then send IDENTIFY in the
++    // MESSAGE OUT phase before the command. Generic disk callers retain the
++    // historical no-ATN behavior unless they explicitly request it.
++    if (!scsiHostPhySelect(target_id, g_initiator_state.initiator_id, requestIdentify))
+@@ -766,0 +790,4 @@ int scsiInitiatorRunCommand(int target_id,
++        g_scsiInitiatorTimeoutSignals = g_scsiHostPhySelectionSignals;
++        g_scsiInitiatorTimeoutGPIOState = scsiHostPhyGetGPIOState();
++        g_scsiInitiatorTimeoutSelectionStage = g_scsiHostPhySelectionStage;
++        if (requestIdentify) scsiHostPhySetATN(false);
+@@ -778,0 +806,22 @@ int scsiInitiatorRunCommand(int target_id,
++        uint32_t elapsed = (uint32_t)(millis() - start);
++
++        // ZBridge commands run synchronously on the USB command path. The
++        // historical timeout argument only extended the watchdog; it did not
++        // return from a target that selected successfully but never asserted
++        // a command phase. Allow bridge callers to bound that wait, reset the
++        // wedged SCSI transaction, and report an error instead of disappearing
++        // from USB until the MCU watchdog eventually fires.
++        if (abortOnTimeout && timeout > 0 && elapsed >= timeout)
++        {
++            g_scsiInitiatorTimeoutSignals = scsiHostPhyGetSignals();
++            g_scsiInitiatorTimeoutGPIOState = scsiHostPhyGetGPIOState();
++            g_scsiInitiatorTimeoutPhase = (int8_t)phase;
++            g_scsiInitiatorTimeoutSelectionStage = g_scsiHostPhySelectionStage;
++            logmsg("SCSI initiator command phase timeout for target ", target_id,
++                   ", phase ", (int)phase, ", signals ",
++                   (uint32_t)g_scsiInitiatorTimeoutSignals);
++            if (requestIdentify) scsiHostPhySetATN(false);
++            scsiHostPhyReset();
++            return -4;
++        }
++
+@@ -780 +829 @@ int scsiInitiatorRunCommand(int target_id,
+-        if ((uint32_t)(millis() - start) < timeout)
++        if (elapsed < timeout)
+@@ -788,0 +838 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 5;
+@@ -798,0 +849 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 0;
+@@ -800,0 +852 @@ int scsiInitiatorRunCommand(int target_id,
++            if (requestIdentify) scsiHostPhySetATN(false);
+@@ -803,0 +856 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 1;
+@@ -807,0 +861 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 2;
+@@ -827,0 +882 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 3;
+@@ -847,0 +903 @@ int scsiInitiatorRunCommand(int target_id,
++            g_scsiInitiatorPhaseHistory |= 1u << 4;
+@@ -856,0 +913,2 @@ int scsiInitiatorRunCommand(int target_id,
++    if (requestIdentify) scsiHostPhySetATN(false);
++    if (phase == BUS_FREE) g_scsiInitiatorPhaseHistory |= 1u << 6;
+@@ -858,0 +917,13 @@ int scsiInitiatorRunCommand(int target_id,
++    // A target that asserted BSY (selection stage 3/4) and then dropped the
++    // bus before presenting any phase is not a selection failure. Preserve
++    // the real state and classify it as a bounded phase failure so ZBridge's
++    // host receives useful diagnostics instead of the stale "no BSY" text.
++    if (status == -1 && g_scsiHostPhySelectionStage >= 3)
++    {
++        g_scsiInitiatorTimeoutSignals = scsiHostPhyGetSignals();
++        g_scsiInitiatorTimeoutGPIOState = scsiHostPhyGetGPIOState();
++        g_scsiInitiatorTimeoutPhase = BUS_FREE;
++        g_scsiInitiatorTimeoutSelectionStage = g_scsiHostPhySelectionStage;
++        return -4;
++    }
++
+@@ -871 +942 @@ int scsiInitiatorMessage(int target_id,
+-    if (!scsiHostPhySelect(target_id, g_initiator_state.initiator_id))
++    if (!scsiHostPhySelect(target_id, g_initiator_state.initiator_id, false))
+diff --git a/src/ZuluSCSI_initiator.h b/src/ZuluSCSI_initiator.h
+index b507993..1bb9650 100644
+--- a/src/ZuluSCSI_initiator.h
++++ b/src/ZuluSCSI_initiator.h
+@@ -51,0 +52,8 @@ int scsiInitiatorGetOwnID();
++void scsiInitiatorSetOwnID(uint8_t initiator_id);
++
++// Raw SCSI signal state captured immediately before a bounded command timeout.
++extern uint32_t g_scsiInitiatorTimeoutSignals;
++extern int8_t g_scsiInitiatorTimeoutPhase;
++extern uint8_t g_scsiInitiatorTimeoutSelectionStage;
++extern uint8_t g_scsiInitiatorPhaseHistory;
++extern uint32_t g_scsiInitiatorTimeoutGPIOState;
+@@ -60 +68,3 @@ int scsiInitiatorRunCommand(int target_id,
+-                            uint32_t timeout = 30000);
++                            uint32_t timeout = 30000,
++                            bool abortOnTimeout = false,
++                            bool requestIdentify = false);

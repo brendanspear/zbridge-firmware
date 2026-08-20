@@ -1,0 +1,45 @@
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+index 229cf28..745d68c 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+@@ -24,6 +24,10 @@
+ #include "ZuluSCSI_log.h"
+ #include "ZuluSCSI_log_trace.h"
+ #include "scsi_accel_host.h"
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++#include "ZBridge.h"
++#include "ZBridgeFastHostWrite.h"
++#endif
+ #include <assert.h>
+ 
+ #include <scsi2sd.h>
+@@ -449,8 +452,29 @@ uint16_t scsiHostReadOneWord(int* parityError)
+ 
+ uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
+ {
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++    // Protocol v7 starts one Akai SEND command for an entire PCM window and
++    // feeds its DATA OUT phase from the USB-owned ring. Bypass logging here:
++    // `data` is only a non-null initiator sentinel, not a `count`-byte buffer.
++    if (zbridge_streaming_write_active() && count >= 512)
++    {
++        return zbridgeFastHostStreamWrite(count, &g_scsiHostPhyReset);
++    }
++#endif
++
+     scsiLogDataOut(data, count);
+ 
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++    // Legacy/fallback Direct-RAM PCM blocks use the pointer-backed PIO/DMA
++    // writer. Small command and SysEx payloads stay on the upstream byte path.
++    const uint32_t accelerated = zbridgeFastHostWrite(
++        data, count, &g_scsiHostPhyReset);
++    if (accelerated != UINT32_MAX)
++    {
++        return accelerated;
++    }
++#endif
++
+     int cd_start = SCSI_IN(CD);
+     int msg_start = SCSI_IN(MSG);
+ 

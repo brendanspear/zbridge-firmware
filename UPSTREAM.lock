@@ -1,0 +1,11 @@
+repository=https://github.com/ZuluSCSI/ZuluSCSI-firmware.git
+commit=1e03e1e289788a8ae0f3d6df273d4eadd185ed10
+release=2026.07.18
+boards=ZuluSCSI_Blaster
+status=hardware-proven-protocol-v9-build-52
+
+# This pin makes the integration reproducible. The files in this directory
+# are an overlay, not a complete upstream source tree. The exact patches,
+# source files, and build recipe live in pinned-overlay/. Protocol-v9 build 52
+# passed native-USB DATA OUT, exact 20 MiB DATA IN, live MIDI/CC/SysEx,
+# role-restoration, and checksum/soak gates on an S3200XL OS 2.00.

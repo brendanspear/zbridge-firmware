@@ -1,0 +1,6 @@
+diff --git a/platformio.ini b/platformio.ini
+index 77a528f..41b70dc 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -214,0 +215 @@ build_flags =
++    -Wl,--wrap=usbd_app_driver_get_cb

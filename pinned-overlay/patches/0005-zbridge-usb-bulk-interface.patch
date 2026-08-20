@@ -1,0 +1,13 @@
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+index 05d2cdb..2132993 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+@@ -809,5 +809,8 @@ void platform_late_init()
+ #ifndef PIO_FRAMEWORK_ARDUINO_NO_USB
+     Serial.begin();
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++    zbridge_usb_init();
++#endif
+ #endif
+     scsi_accel_rp2040_init();
+ 

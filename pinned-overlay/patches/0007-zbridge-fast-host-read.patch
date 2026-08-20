@@ -1,0 +1,37 @@
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+index 745d68c..8c07a6b 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+@@ -27,6 +27,7 @@
+ #if defined(ZBRIDGE_DIRECT_RAM_MODE)
+ #include "ZBridge.h"
+ #include "ZBridgeFastHostWrite.h"
++#include "ZBridgeFastHostRead.h"
+ #endif
+ #include <assert.h>
+ 
+@@ -362,6 +363,24 @@ uint32_t scsiHostRead(uint8_t *data, uint32_t count)
+     int cd_start = SCSI_IN(CD);
+     int msg_start = SCSI_IN(MSG);
+ 
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++    // Protocol v9 uses a non-null sentinel for a continuous Akai RECEIVE(6)
++    // that is much larger than the command parser buffer. Stream PIO DATA IN
++    // directly to the vendor USB endpoint and never log/dereference sentinel
++    // bytes through the ordinary pointer-backed path.
++    if (zbridge_streaming_read_active() && count >= 512)
++    {
++        count = zbridgeFastHostStreamRead(
++            count, parityError, g_scsiHostBusWidth, &g_scsiHostPhyReset);
++        if (count == UINT32_MAX || g_scsiHostPhyReset
++            || (parityError && *parityError))
++        {
++            return 0;
++        }
++        return count;
++    }
++#endif
++
+     if ((count & 1) == 0 && ((uint32_t)data & 1) == 0)
+     {
+         // Even number of bytes, use accelerated routine
