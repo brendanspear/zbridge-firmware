@@ -22,6 +22,7 @@ git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0005-zbridge-usb-
 git -C "$zbridge_build_dir" apply --unidiff-zero "$zbridge_script_dir/patches/0006-zbridge-usb-vendor-driver-hook.patch"
 git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0007-zbridge-fast-host-read.patch"
 git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0008-zbridge-boot-mode.patch"
+git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0009-zbridge-disk-scan-stack.patch"
 cp "$zbridge_script_dir/src/ZBridge.cpp" "$zbridge_build_dir/src/ZBridge.cpp"
 cp "$zbridge_script_dir/src/ZBridge.h" "$zbridge_build_dir/src/ZBridge.h"
 cp "$zbridge_script_dir/src/ZBridgeFastHostWrite.cpp" "$zbridge_build_dir/src/ZBridgeFastHostWrite.cpp"

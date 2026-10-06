@@ -486,7 +486,7 @@ void handleBootMode(const uint8_t *payload, uint16_t length) {
 
 void handleGetInfo() {
     uint8_t info[64] = {};
-    write32(info, 0x35000035); // build 53: persistent software boot mode
+    write32(info, 0x36000036); // build 54: reduce disk-scan stack use
     write16(info + 4, 9);
     write32(info + 6, (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9)
                            | (1u << 10) | (1u << 11) | (1u << 12)

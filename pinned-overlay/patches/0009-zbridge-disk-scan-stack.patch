@@ -1,0 +1,41 @@
+--- a/src/ZuluSCSI.cpp
++++ b/src/ZuluSCSI.cpp
+@@ -669,7 +669,9 @@
+     return false;
+   }
+ #endif // ZULUSCSI_HARDWARE_CONFIG
+-  char imgdir[MAX_FILE_PATH];
++  // Main-core image enumeration is serialized. Keep pathname scratch out
++  // of the 3 KiB RP2350 stack so SD calls and USB IRQs have headroom.
++  static char imgdir[MAX_FILE_PATH];
+   ini_gets("SCSI", "Dir", "/", imgdir, sizeof(imgdir), CONFIGFILE);
+   int dirindex = 0;
+   
+@@ -722,7 +724,7 @@
+       }
+     }
+ 
+-    char name[MAX_FILE_PATH+1];
++    static char name[MAX_FILE_PATH+1];
+     if(!file.isDir() || scsiDiskFolderContainsCueSheet(&file) || scsiDiskFolderIsTapeFolder(&file)) {
+       file.getName(name, MAX_FILE_PATH+1);
+       file.close();
+@@ -739,7 +741,7 @@
+       if (strncasecmp(name, CREATEFILE, strlen(CREATEFILE)) == 0)
+       {
+         logmsg("-- Special filename: '", name, "'");
+-        char imgname[MAX_FILE_PATH+1];
++        static char imgname[MAX_FILE_PATH+1];
+         if (createImage(name, imgname))
+         {
+           // Created new image file, use its name instead of the name of the command file
+@@ -860,7 +862,8 @@
+         }
+ 
+         // Add the directory name to get the full file path
+-        char fullname[MAX_FILE_PATH * 2 + 2] = {0};
++        static char fullname[MAX_FILE_PATH * 2 + 2];
++        memset(fullname, 0, sizeof(fullname));
+         strncpy(fullname, imgdir, MAX_FILE_PATH);
+         if (fullname[strlen(fullname) - 1] != '/') strcat(fullname, "/");
+         strcat(fullname, name);
