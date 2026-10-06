@@ -47,3 +47,6 @@ bool zbridge_streaming_read_active();
 // Queue one exact SCSI DATA IN window on the vendor-specific USB endpoint.
 // Returns false after a bounded disconnect, abort, or endpoint timeout.
 bool zbridge_stream_write(const uint8_t *source, uint32_t count);
+
+// Apply a validated SD-card boot override before platform_late_init().
+void zbridge_load_boot_mode();

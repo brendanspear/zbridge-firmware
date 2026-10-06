@@ -28,3 +28,5 @@ uint32_t zbridgeFastHostStreamWrite(uint32_t, volatile int *) {
 uint32_t zbridgeFastHostStreamRead(uint32_t, int *, int, volatile int *) {
     return UINT32_MAX;
 }
+
+void zbridge_load_boot_mode() {}

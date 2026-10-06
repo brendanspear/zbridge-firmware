@@ -31,6 +31,7 @@ extern "C" {
 }
 
 extern SdFs SD;
+extern bool g_scsi_initiator;
 
 namespace {
 constexpr uint8_t SYNC0 = 0xAA;
@@ -441,14 +442,60 @@ void closeTransferFile() {
     g.writing = g.reading = false;
 }
 
+constexpr const char *BOOT_MODE_FILE = "zbridge-mode.dat";
+constexpr const char *BOOT_MODE_TEMP = "zbridge-mode.tmp";
+
+// Versioned record; invalid/truncated data never forces a different role.
+bool readBootMode(uint8_t &mode) {
+    FsFile file = SD.open(BOOT_MODE_FILE, O_RDONLY);
+    uint8_t record[8];
+    if (!file.isOpen() || file.fileSize() != sizeof(record) ||
+        file.read(record, sizeof(record)) != sizeof(record)) return false;
+    if (memcmp(record, "ZBM1", 4) || record[4] > 1 || record[5] != 0 ||
+        read16(record + 6) != crc16(record, 6)) return false;
+    mode = record[4];
+    return true;
+}
+
+void handleBootMode(const uint8_t *payload, uint16_t length) {
+    if (length != 1 || payload[0] > 1) {
+        sendError(ERR_INVALID_LENGTH, 0x33, "mode must be disk=0 or direct=1"); return;
+    }
+    if (g.direct || g.writing || g.reading || g.quiesce || scsiDev.phase != BUS_FREE) {
+        sendError(ERR_DIRECT_BUSY, 0x33, "finish transfers before changing mode"); return;
+    }
+    uint8_t record[8] = {'Z','B','M','1',payload[0],0,0,0};
+    write16(record + 6, crc16(record, 6));
+    FsFile file = SD.open(BOOT_MODE_TEMP, O_WRONLY | O_CREAT | O_TRUNC);
+    if (!file.isOpen() || file.write(record, sizeof(record)) != sizeof(record) || !file.sync()) {
+        sendError(ERR_SD_WRITE, 0x33, "cannot save boot mode"); return;
+    }
+    file.close();
+    if ((SD.exists(BOOT_MODE_FILE) && !SD.remove(BOOT_MODE_FILE)) ||
+        !SD.rename(BOOT_MODE_TEMP, BOOT_MODE_FILE)) {
+        sendError(ERR_SD_WRITE, 0x33, "cannot commit boot mode"); return;
+    }
+    uint8_t saved;
+    if (!readBootMode(saved) || saved != payload[0]) {
+        sendError(ERR_SD_WRITE, 0x33, "boot mode verification failed"); return;
+    }
+    // Persist only. The host asks the owner to power-cycle the sampler/board,
+    // avoiding a disappearing SCSI disk while the sampler is still running.
+    sendAck();
+}
+
 void handleGetInfo() {
     uint8_t info[64] = {};
-    write32(info, 0x34000034); // 52.0.0 build 52: native continuous DATA IN
+    write32(info, 0x35000035); // build 53: persistent software boot mode
     write16(info + 4, 9);
     write32(info + 6, (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9)
                            | (1u << 10) | (1u << 11) | (1u << 12)
                            | (1u << 13) | (1u << 14) | (1u << 15)
-                           | (1u << 16));
+                           | (1u << 16) | (1u << 17));
+    // Disk mode does not offer live role handoff. Restart in Direct RAM mode
+    // before advertising discovery, MIDI, and native bulk transfer support.
+    if (!g_scsi_initiator) write32(info + 6, (1u << 4) | (1u << 5) | (1u << 9) | (1u << 17));
+    info[13] = g_scsi_initiator ? 1 : 0;
     info[10] = activeDiskID(); info[11] = 1; info[12] = 0;
     pico_unique_board_id_t uid; pico_get_unique_board_id(&uid);
     static const char hex[] = "0123456789ABCDEF";
@@ -537,6 +584,7 @@ void handleRead(const uint8_t *payload, uint16_t length) {
 }
 
 void handleDiscovery(const uint8_t *payload, uint16_t length) {
+    if (!g_scsi_initiator) { sendError(ERR_ROLE_HANDOFF, CMD_AKAI_DISCOVER, "restart in Direct RAM mode"); return; }
     if (length != 2) { sendError(ERR_INVALID_LENGTH, CMD_AKAI_DISCOVER, "want target+initiator"); return; }
     uint8_t requested = payload[0], initiator = payload[1];
     if (initiator > 7 || (requested <= 7 && requested == initiator)) { sendError(ERR_SCSI_ID_CONFLICT, CMD_AKAI_DISCOVER, "SCSI ID conflict"); return; }
@@ -573,6 +621,7 @@ void handleDiscovery(const uint8_t *payload, uint16_t length) {
 }
 
 void handleSessionBegin(const uint8_t *payload, uint16_t length) {
+    if (!g_scsi_initiator) { sendError(ERR_ROLE_HANDOFF, CMD_AKAI_SESSION_BEGIN, "restart in Direct RAM mode"); return; }
     if (length != 2) { sendError(ERR_INVALID_LENGTH, CMD_AKAI_SESSION_BEGIN, "want target+initiator"); return; }
     if (g.direct) { sendError(ERR_DIRECT_BUSY, CMD_AKAI_SESSION_BEGIN, "session already active"); return; }
     if (payload[0] == payload[1]) { sendError(ERR_SCSI_ID_CONFLICT, CMD_AKAI_SESSION_BEGIN, "SCSI ID conflict"); return; }
@@ -1180,6 +1229,15 @@ void dispatch(uint8_t opcode, const uint8_t *payload, uint16_t length) {
     switch (opcode) {
     case CMD_PING: sendFrame(RSP_PONG); break;
     case CMD_GET_INFO: handleGetInfo(); break;
+    case 0x33: handleBootMode(payload, length); break;
+    case 0x34: {
+        if (length != 0) { sendError(ERR_INVALID_LENGTH, opcode, "no payload expected"); break; }
+        uint8_t saved = 0xFF;
+        readBootMode(saved);
+        uint8_t mode[2] = {uint8_t(g_scsi_initiator ? 1 : 0), saved};
+        sendAck(mode, sizeof(mode));
+        break;
+    }
     case CMD_SUBSCRIBE: sendFrame(RSP_PONG); break;
     case CMD_LIST_FILES: handleList(payload, length); break;
     case CMD_FILE_OPEN_WRITE: handleOpenWrite(payload, length); break;
@@ -1564,4 +1622,9 @@ void zbridge_usb_init() {
     g_vendorInterfaceID = USB.registerInterface(
         1, vendorInterfaceDescriptor, nullptr, TUD_VENDOR_DESC_LEN, 2, 0);
     USB.connect();
+}
+
+void zbridge_load_boot_mode() {
+    uint8_t mode;
+    if (readBootMode(mode)) g_scsi_initiator = mode == 1;
 }

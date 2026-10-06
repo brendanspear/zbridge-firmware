@@ -1,0 +1,13 @@
+diff --git a/src/ZuluSCSI.cpp b/src/ZuluSCSI.cpp
+--- a/src/ZuluSCSI.cpp
++++ b/src/ZuluSCSI.cpp
+@@ -1610,6 +1610,9 @@
+ extern "C" void zuluscsi_setup(void)
+ {
+   platform_init();
++  // Read the software override before configuring SCSI GPIOs.
++  // Missing/invalid settings preserve the physical switch selection.
++  if (mountSDCard()) zbridge_load_boot_mode();
+   platform_late_init();
+ 
+   bool is_initiator = false;

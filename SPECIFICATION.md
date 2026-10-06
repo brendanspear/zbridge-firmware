@@ -842,3 +842,28 @@ Mac                          ZuluSCSI
 ---
 
 *End of Specification*
+
+## Build 53: persistent boot-role selection (candidate)
+
+Protocol remains 9. Capability bit 17 gates software boot-mode commands.
+GET_INFO reserved byte 13 reports current mode: 0 = SD disk, 1 = Direct RAM.
+`0x34 GET_BOOT_MODE` takes no payload; ACK body is `[active, saved]`, with
+saved 255 meaning no valid override (physical switch controls boot).
+`0x33 SAVE_BOOT_MODE` takes one byte, 0 or 1. It refuses an active direct session,
+file transfer, quiesce, or non-free SCSI phase. Success means the 8-byte record
+was written, synced, committed, and read back. It does not change the active role.
+Power-cycle the board and sampler after saving; USB power must also be removed.
+
+The SD root `zbridge-mode.dat` record is `ZBM1`, one mode byte, zero reserved
+byte, then CRC16-CCITT-FALSE over the first six bytes, little-endian. Missing or
+invalid records preserve physical-switch selection. Remove the file to restore
+switch control. Settings travel with the SD card. A temporary `.tmp` file is
+synced before replacement; interruption during replacement can lose the override,
+which safely returns to switch selection rather than guessing a mode.
+
+Role is loaded before `platform_late_init`, including native initiator GPIO
+setup for Direct RAM. The compile-time force-on is removed. SD mode withholds
+Direct RAM/MIDI capability bits and rejects discovery/session start. Native
+initiator disk imaging stays disabled. Software bootloader is available in both
+roles. Build 52 bulk read/write paths are retained. Hardware verification remains
+pending; compilation alone is not an SD/playback or Direct RAM result.

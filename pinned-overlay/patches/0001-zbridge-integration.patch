@@ -4,12 +4,6 @@ index 7013585..05d2cdb 100644
 +++ b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
 @@ -22,0 +23 @@
 +#include "ZBridge.h"
-@@ -630,0 +632,5 @@ void platform_late_init()
-+#if defined(ZBRIDGE_NATIVE_DIAGNOSTIC) || defined(ZBRIDGE_DIRECT_RAM_MODE)
-+    // Diagnostic build: boot through the platform's real initiator branch so
-+    // ZBridge can distinguish a live role-handoff bug from a PHY limitation.
-+    g_scsi_initiator = true;
-+#endif
 @@ -1066,0 +1073 @@ uint32_t platform_write_to_serial(uint8_t* data, uint32_t len)
 +    if (zbridge_binary_active()) return 0;
 @@ -1087,0 +1095 @@ static void usb_log_poll()
