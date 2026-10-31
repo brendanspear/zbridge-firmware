@@ -30,3 +30,6 @@ uint32_t zbridgeFastHostStreamRead(uint32_t, int *, int, volatile int *) {
 }
 
 void zbridge_load_boot_mode() {}
+
+// No accelerated writer is linked into the self-flash bootloader.
+void zbridgeFastHostWriteInvalidatePIO() {}

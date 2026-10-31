@@ -87,7 +87,7 @@ bool ensureInitialized()
     if (g_dmaChannel >= 0 && g_programOffset >= 0) return true;
     if (!pio_can_add_program(kPIO, &g_program)) return false;
 
-    int channel = dma_claim_unused_channel(false);
+    int channel = g_dmaChannel >= 0 ? g_dmaChannel : dma_claim_unused_channel(false);
     if (channel < 0) return false;
 
     g_programOffset = int(pio_add_program(kPIO, &g_program));
@@ -227,6 +227,14 @@ static uint32_t runFastHostWrite(const uint8_t *data, uint32_t count,
     return completed;
 }
 
+void zbridgeFastHostWriteInvalidatePIO()
+{
+    if (g_dmaChannel >= 0) dma_channel_abort(uint(g_dmaChannel));
+    pio_sm_set_enabled(kPIO, kStateMachine, false);
+    pio_sm_clear_fifos(kPIO, kStateMachine);
+    g_programOffset = -1;
+}
+
 uint32_t zbridgeFastHostWrite(const uint8_t *data, uint32_t count,
                               volatile int *resetFlag)
 {
@@ -240,6 +248,8 @@ uint32_t zbridgeFastHostStreamWrite(uint32_t count,
 }
 
 #else
+
+void zbridgeFastHostWriteInvalidatePIO() {}
 
 uint32_t zbridgeFastHostWrite(const uint8_t *, uint32_t,
                               volatile int *)

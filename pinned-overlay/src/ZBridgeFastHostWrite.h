@@ -14,3 +14,7 @@ uint32_t zbridgeFastHostWrite(const uint8_t *data, uint32_t count,
 // host buffer, allowing one Akai SEND command to span many USB frames.
 uint32_t zbridgeFastHostStreamWrite(uint32_t count,
                                     volatile int *resetFlag);
+
+// scsi_accel_host_init clears pio0 instruction memory. Invalidate the writer
+// before that clear so the next DATA OUT reloads its program; keep DMA leased.
+void zbridgeFastHostWriteInvalidatePIO();

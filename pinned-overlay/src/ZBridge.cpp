@@ -11,6 +11,7 @@
  */
 
 #include "ZBridge.h"
+#include "ZuluSCSI_log.h"
 
 #include <Arduino.h>
 #include <CoreMutex.h>
@@ -20,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <tusb.h>
+#include <device/usbd_pvt.h>
 
 #include "ZuluSCSI_disk.h"
 #include "ZuluSCSI_initiator.h"
@@ -32,6 +34,8 @@ extern "C" {
 
 extern SdFs SD;
 extern bool g_scsi_initiator;
+extern uint32_t g_zbridgeLastReadCount;
+extern uint32_t g_zbridgeLastWriteCount;
 
 namespace {
 constexpr uint8_t SYNC0 = 0xAA;
@@ -49,9 +53,9 @@ enum Command : uint8_t {
     CMD_PING = 0x01, CMD_GET_INFO = 0x02, CMD_SUBSCRIBE = 0x09,
     CMD_LIST_FILES = 0x20, CMD_FILE_OPEN_WRITE = 0x21,
     CMD_FILE_WRITE_CHUNK = 0x22, CMD_FILE_CLOSE_COMMIT = 0x23,
-    CMD_FILE_READ_OPEN = 0x24, CMD_FILE_READ_CHUNK = 0x25,
+    CMD_FILE_READ_OPEN = 0x24, CMD_FILE_READ_CHUNK = 0x25, CMD_FILE_BULK_WRITE = 0x26,
     CMD_EJECT_CYCLE = 0x30, CMD_QUIESCE = 0x31, CMD_EXIT = 0x3F,
-    CMD_REBOOT_BOOTLOADER = 0x32,
+    CMD_REBOOT_BOOTLOADER = 0x32, CMD_MOUNT_IMAGE = 0x35,
     CMD_MIDI_SEND_BATCH = 0x40, CMD_MIDI_FLUSH = 0x41,
     CMD_AKAI_DISCOVER = 0x50, CMD_AKAI_SESSION_BEGIN = 0x51,
     CMD_AKAI_SCSI_EXECUTE = 0x52, CMD_AKAI_SESSION_END = 0x53,
@@ -101,6 +105,7 @@ struct State {
     bool quiesce = false;
     bool direct = false;
     uint8_t directTarget = 0xFF;
+    bool legacyAkai = false;
     uint32_t lastActivity = 0;
     uint32_t primaryTimeoutSignals = 0;
     uint32_t fallbackTimeoutSignals = 0;
@@ -110,6 +115,10 @@ struct State {
     uint8_t fallbackSelectionStage = 0;
     uint8_t primaryPhaseHistory = 0;
     uint8_t fallbackPhaseHistory = 0;
+    int lastInquiryStatus = 0;
+    uint32_t lastInquiryReadCount = 0;
+    uint8_t lastInquiryPrefix[8] = {};
+    uint8_t lastInquiryPhase = 0;
     uint32_t primaryGPIOState = 0;
     uint32_t fallbackGPIOState = 0;
     FsFile file;
@@ -240,6 +249,68 @@ void pumpVendorBenchmark() {
     }
 }
 
+// Streamed file upload (build 73). After FILE_OPEN_WRITE, the host sends the
+// whole file on the vendor bulk endpoint instead of in framed CDC chunks; USB
+// NAKs pace it while the SD write runs. FILE_CLOSE_COMMIT drains the stream
+// before it checks the size. The idle Direct RAM ring slot is the staging
+// buffer: RAM has no room for another one, and a file upload never runs
+// alongside an Akai bulk stream.
+struct FileBulkState {
+    bool active = false;
+    bool failed = false;
+    uint32_t expectedBytes = 0;
+    uint32_t receivedBytes = 0;
+    uint16_t fill = 0;
+    uint32_t lastRxMillis = 0;
+    bool stallLogged = false;
+} g_fileBulk;
+
+void pumpVendorFileWrite() {
+    if (!g_fileBulk.active || g_fileBulk.failed) return;
+    uint8_t *staging = g_bulk.slots[0].data;
+    while (g_fileBulk.receivedBytes < g_fileBulk.expectedBytes) {
+        uint32_t received = 0;
+        {
+            CoreMutex mutex(&USB.mutex, false);
+            if (!mutex) break;
+            tud_task();
+            uint32_t available = tud_vendor_available();
+            if (!available) {
+                // A zero-byte read re-runs TinyUSB's OUT re-arm check.
+                tud_vendor_read(staging + g_fileBulk.fill, 0);
+                if (!g_fileBulk.stallLogged && g_fileBulk.lastRxMillis
+                    && uint32_t(millis() - g_fileBulk.lastRxMillis) > 300) {
+                    g_fileBulk.stallLogged = true;
+                    logmsg("ZBFILE stall at ", (int)g_fileBulk.receivedBytes,
+                           " busy=", (int)usbd_edpt_busy(0, g_vendorEndpointOut),
+                           " ep=", (int)g_vendorEndpointOut,
+                           " avail=", (int)tud_vendor_available());
+                }
+                break;
+            }
+            uint32_t requested = MAX_PIPELINED_PCM - g_fileBulk.fill;
+            uint32_t remaining = g_fileBulk.expectedBytes - g_fileBulk.receivedBytes;
+            if (requested > available) requested = available;
+            if (requested > remaining) requested = remaining;
+            received = tud_vendor_read(staging + g_fileBulk.fill, requested);
+        }
+        if (!received) break;
+        g_fileBulk.fill = uint16_t(g_fileBulk.fill + received);
+        g_fileBulk.receivedBytes += received;
+        g_fileBulk.lastRxMillis = millis();
+        g.lastActivity = millis();
+        if (g_fileBulk.fill == MAX_PIPELINED_PCM
+            || g_fileBulk.receivedBytes == g_fileBulk.expectedBytes) {
+            if (g.file.write(staging, g_fileBulk.fill) != int(g_fileBulk.fill)) {
+                logmsg("ZBFILE sd write failed at ", (int)g_fileBulk.receivedBytes);
+                g_fileBulk.failed = true;
+                return;
+            }
+            g_fileBulk.fill = 0;
+        }
+    }
+}
+
 constexpr uint16_t CRC16_NIBBLE[16] = {
     0x0000, 0x1021, 0x2042, 0x3063,
     0x4084, 0x50A5, 0x60C6, 0x70E7,
@@ -338,6 +409,7 @@ bool inquiryLooksAkai(const uint8_t inquiry[36]) {
 }
 
 void restoreTargetMode() {
+    g.legacyAkai = false;
     resetBulkStream();
     resetBulkReadStream();
     if (!g.direct) return;
@@ -356,6 +428,80 @@ void restoreTargetMode() {
     g.direct = false;
     g.directTarget = 0xFF;
     g.quiesce = false;
+}
+
+uint32_t legacyWord(const uint8_t *bytes, size_t count) {
+    uint32_t value = 0;
+    for (size_t i = 0; i < count; ++i) value |= uint32_t(bytes[i]) << (i * 7);
+    return value;
+}
+
+bool legacyStatusLooksValid(const uint8_t inquiry[9], const uint8_t status[21]) {
+    const uint8_t observed[9] = {0xC7,0,0,0,4,0,0x48,4,0x28};
+    if (memcmp(inquiry, observed, 9) || status[0] != 0xF0 || status[1] != 0x47 ||
+        status[2] != 0 || status[3] != 1 || status[4] != 0x48 || status[20] != 0xF7 ||
+        status[5] != inquiry[8] || status[6] != inquiry[7] || status[19] != 0) return false;
+    for (unsigned i = 2; i < 20; ++i) if (status[i] & 0x80) return false;
+    const uint32_t blocks = legacyWord(status + 7, 2), freeBlocks = legacyWord(status + 9, 2);
+    const uint32_t words = legacyWord(status + 11, 4), freeWords = legacyWord(status + 15, 4);
+    return blocks > 0 && blocks <= 4096 && freeBlocks <= blocks &&
+        words >= 524288 && words <= 16777216 && freeWords <= words;
+}
+
+// Probe only the hardware-observed legacy4.40 fingerprint, then corroborate
+// with a fresh documented RSTAT reply. Never accept the9-byte reply alone.
+// The36-byte return is an API compatibility descriptor, NOT raw INQUIRY:
+// byte3 bit7 marks its derived identity; raw9 and RSTAT remain in diagnostics.
+// Family is deliberately S1000/S1100; this does not identify an exact variant.
+bool verifyLegacyAkai(uint8_t target, uint8_t inquiry[36]) {
+    const uint8_t observed[9] = {0xC7,0,0,0,4,0,0x48,4,0x28};
+    if (memcmp(inquiry, observed, 9)) return false;
+    uint8_t raw[9], response[21] = {}; memcpy(raw, inquiry, 9);
+    bool valid = false;
+    bool enabledMode = false;
+    g_zbridgeLegacyProbe = {true, false, false, 0, 1};
+    auto execute = [&](const uint8_t cdb[6], uint8_t *in, size_t inCount,
+                       const uint8_t *out = nullptr, size_t outCount = 0) {
+        return scsiInitiatorRunCommand(target, cdb, 6, in, inCount, out, outCount,
+            false, 1500, true, false) == 0 && (!inCount || g_zbridgeLastReadCount == inCount)
+            && g_zbridgeProbeStatus == 0 && g_zbridgeProbeMessage == 0;
+    };
+    do {
+        const uint8_t inq[6] = {0x12,0,0,0,9,0};
+        if (!execute(inq, raw, 9) || memcmp(raw, observed, 9)) break;
+        // The normal transfer client disables MIDI via SCSI on exit. Enable
+        // only that transport before the fresh status challenge; no RAM writes.
+        const uint8_t mode[6] = {0x09,0,1,0,0,0};
+        if (!execute(mode, nullptr, 0)) break;
+        enabledMode = true;
+        uint8_t pending[3] = {};
+        const uint8_t poll[6] = {0x0D,0,0,0,0,0};
+        if (!execute(poll, pending, 3) || pending[0] || pending[1] || pending[2]) break;
+        const uint8_t rstat[6] = {0xF0,0x47,0,0,0x48,0xF7};
+        const uint8_t send[6] = {0x0C,0,0,0,sizeof(rstat),0};
+        if (!execute(send, nullptr, 0, rstat, sizeof(rstat))) break;
+        uint32_t began = millis();
+        do {
+            if (!execute(poll, pending, 3)) break;
+            if (pending[0] || pending[1] || pending[2]) break;
+            delay(5); platform_poll(); platform_reset_watchdog();
+        } while (uint32_t(millis() - began) < 500);
+        if (pending[0] || pending[1] || pending[2] != sizeof(response)) break;
+        const uint8_t receive[6] = {0x0E,0,0,0,sizeof(response),0};
+        if (!execute(receive, response, sizeof(response)) || !legacyStatusLooksValid(raw, response)) break;
+        memset(inquiry, ' ', 36);
+        inquiry[0]=3; inquiry[1]=0; inquiry[2]=0; inquiry[3]=0x80; inquiry[4]=31;
+        inquiry[5]=inquiry[6]=inquiry[7]=0;
+        memcpy(inquiry + 8, "AKAI    ", 8); memcpy(inquiry + 16, "S1000/S1100 MIDI ", 16);
+        memcpy(inquiry + 32, "4.40", 4);
+        valid = true;
+    } while (false);
+    if (!valid && enabledMode) {
+        const uint8_t normal[6] = {0x09,0,0,0,0,0};
+        execute(normal, nullptr, 0);
+    }
+    g_zbridgeLegacyProbe = {false, false, false, 0, 1};
+    return valid;
 }
 
 int enterInitiator(uint8_t target, uint8_t initiator, uint8_t inquiry[36]) {
@@ -388,9 +534,14 @@ int enterInitiator(uint8_t target, uint8_t initiator, uint8_t inquiry[36]) {
     g.primaryGPIOState = 0;
     g.fallbackGPIOState = 0;
     memset(inquiry, 0, 36);
+    // INQUIRY allocation is a maximum, not a required response length.
+    // Finish STATUS/COMMAND COMPLETE for a short response; only independently
+    // corroborated legacy identity below can accept the observed9-byte reply.
+    g_zbridgeLegacyProbe = {true, false, true, 0, 1};
     int status = scsiInitiatorRunCommand(target,
         reinterpret_cast<const uint8_t *>("\x12\0\0\0\x24\0"), 6,
         inquiry, 36, nullptr, 0, false, 1500, true, false);
+    g_zbridgeLegacyProbe = {false, false, false, 0, 1};
 
     // Prefer the Blaster's proven upstream selection sequence, which presents
     // both target and initiator IDs without ATN. If that fails, retry with the
@@ -423,7 +574,18 @@ int enterInitiator(uint8_t target, uint8_t initiator, uint8_t inquiry[36]) {
         }
     }
 
-    if (status != 0 || !inquiryLooksAkai(inquiry)) {
+    g.lastInquiryStatus = status;
+    g.lastInquiryReadCount = g_zbridgeLastReadCount;
+    memcpy(g.lastInquiryPrefix, inquiry, 8);
+    g.lastInquiryPhase = g_scsiInitiatorPhaseHistory;
+
+    if ((status == 0 || status == -2) && g.lastInquiryReadCount == 9 && verifyLegacyAkai(target, inquiry)) {
+        g.legacyAkai = true;
+        g.direct = true; g.directTarget = target; g.lastActivity = millis();
+        return INITIATOR_OK;
+    }
+
+    if (status != 0 || g.lastInquiryReadCount != 36 || !inquiryLooksAkai(inquiry)) {
         g.direct = true; // make restoreTargetMode perform restoration
         restoreTargetMode();
         if (status == -4) return INITIATOR_PHASE_TIMEOUT;
@@ -438,6 +600,7 @@ int enterInitiator(uint8_t target, uint8_t initiator, uint8_t inquiry[36]) {
 }
 
 void closeTransferFile() {
+    g_fileBulk = FileBulkState{};
     if (g.file.isOpen()) g.file.close();
     g.writing = g.reading = false;
 }
@@ -486,15 +649,17 @@ void handleBootMode(const uint8_t *payload, uint16_t length) {
 
 void handleGetInfo() {
     uint8_t info[64] = {};
-    write32(info, 0x36000036); // build 54: reduce disk-scan stack use
+    write32(info, 0x49000049); // build 73: file uploads stream over the vendor bulk endpoint
     write16(info + 4, 9);
     write32(info + 6, (1u << 4) | (1u << 5) | (1u << 7) | (1u << 8) | (1u << 9)
                            | (1u << 10) | (1u << 11) | (1u << 12)
                            | (1u << 13) | (1u << 14) | (1u << 15)
-                           | (1u << 16) | (1u << 17));
+                           | (1u << 16) | (1u << 17) | (1u << 20));
     // Disk mode does not offer live role handoff. Restart in Direct RAM mode
     // before advertising discovery, MIDI, and native bulk transfer support.
-    if (!g_scsi_initiator) write32(info + 6, (1u << 4) | (1u << 5) | (1u << 9) | (1u << 17));
+    // Large frames (bit 10) are mode-independent: the parser buffer and the
+    // file-write handler accept MAX_PAYLOAD in both, and image upload needs them.
+    if (!g_scsi_initiator) write32(info + 6, (1u << 4) | (1u << 5) | (1u << 7) | (1u << 9) | (1u << 10) | (1u << 17) | (1u << 18) | (1u << 20));
     info[13] = g_scsi_initiator ? 1 : 0;
     info[10] = activeDiskID(); info[11] = 1; info[12] = 0;
     pico_unique_board_id_t uid; pico_get_unique_board_id(&uid);
@@ -528,10 +693,104 @@ void handleList(const uint8_t *payload, uint16_t length) {
     root.close(); write16(out + 2, emitted); sendAck(out, 4 + emitted * 41);
 }
 
+// Upload a new pathname, then explicitly mount it. Never unlink the file
+// behind an active SCSI handle (including handles on other target IDs).
+bool mountedImageName(const char *name) {
+    for (int id = 0; id < S2S_MAX_TARGETS; ++id) {
+        image_config_t &img = scsiDiskGetImageConfig(id);
+        char mounted[MAX_FILE_PATH] = {};
+        if (img.file.isOpen() && img.file.getFilename(mounted, sizeof(mounted)) &&
+            strcasecmp(mounted, name) == 0) return true;
+    }
+    return false;
+}
+
+// Opening an image (switchNextImage -> scsiDiskOpenHDDImage -> SdFat) needs
+// more stack than the CDC packet path leaves on the 3 KB core-0 stack; build68
+// overflowed inside ExFatFile::open. The packet handler only queues the
+// request, and zbridge_poll runs it after pumpCDCInput's frame has returned.
+uint8_t g_pendingMount[33];
+bool g_mountPending = false;
+
+// Versioned optional operation: target byte + zero-padded32-byte basename.
+// Restrict this first version to equal-capacity raw fixed disks, preserving
+// the host's capacity/geometry assumptions across a live volume change.
+void handleMountImage(const uint8_t *payload, uint16_t length) {
+    if (length != 33 || payload[0] >= S2S_MAX_TARGETS) {
+        sendError(ERR_INVALID_LENGTH, CMD_MOUNT_IMAGE, "want target+32byte filename"); return;
+    }
+    memcpy(g_pendingMount, payload, sizeof(g_pendingMount));
+    g_mountPending = true;
+}
+
+void runPendingMount() {
+    g_mountPending = false;
+    const uint8_t *payload = g_pendingMount;
+    if (g_scsi_initiator || g.direct || g.writing || g.reading || g.quiesce || scsiDev.phase != BUS_FREE) {
+        sendError(ERR_SCSI_BUSY, CMD_MOUNT_IMAGE, "disk or transfer busy"); return;
+    }
+    const uint8_t target = payload[0];
+    char name[32] = {};
+    if (!validName(payload + 1, name) || strlen(name) < 7 ||
+        strncasecmp(name, "HD", 2) || name[2] != '0' + target ||
+        strcasecmp(name + strlen(name) - 4, ".hda")) {
+        sendError(ERR_FILE_STATE, CMD_MOUNT_IMAGE, "want matching HDn raw .hda"); return;
+    }
+    image_config_t &img = scsiDiskGetImageConfig(target);
+    static char previous[MAX_FILE_PATH];
+    memset(previous, 0, sizeof(previous));
+    if (!img.file.isOpen() || img.deviceType != S2S_CFG_FIXED || img.bytesPerSector != 512 ||
+        img.file.isRom() || img.file.isFolder() ||
+        !img.file.getFilename(previous, sizeof(previous))) {
+        sendError(ERR_NO_IMAGE, CMD_MOUNT_IMAGE, "no mounted raw512 fixed disk"); return;
+    }
+    // Pin to root-file identity. A basename from an image directory must not
+    // resolve to a different file in the root during rollback.
+    if (img.image_directory || strcasecmp(previous, img.current_image) != 0 ||
+        getBlockSize(name, target) != 512) {
+        sendError(ERR_FILE_STATE, CMD_MOUNT_IMAGE, "root raw512 images only"); return;
+    }
+    FsFile candidate = SD.open(name, O_RDONLY);
+    if (!candidate.isOpen() || candidate.isDir() || !candidate.fileSize() ||
+        candidate.fileSize() % 512 || candidate.fileSize() != img.file.size()) {
+        candidate.close();
+        sendError(ERR_FILE_STATE, CMD_MOUNT_IMAGE, "missing or different capacity image"); return;
+    }
+    candidate.close();
+    g.quiesce = true;
+    img.file.flush();
+    scsiDiskPrefetchInvalidate(target);
+    bool switched = switchNextImage(img, name);
+    bool restored = switched || switchNextImage(img, previous);
+    scsiDiskPrefetchInvalidate(target);
+    if (!restored) {
+        img.file.close();
+        img.ejected = true;
+        img.reinsert_after_eject = false;
+    }
+    g.quiesce = false;
+    if (!switched) {
+        sendError(ERR_SD_READ, CMD_MOUNT_IMAGE,
+                  restored ? "mount failed; previous restored" : "mount and rollback failed; disk ejected");
+        return;
+    }
+    // At boot the bridge mounts the first root HDn file it finds, so a
+    // replaced image left as HDn* could come back after a power cycle. Keep
+    // one copy under a name the boot scan never mounts (no HD prefix).
+    static char retired[MAX_FILE_PATH];
+    snprintf(retired, sizeof(retired), "OLD_%s", previous);
+    if (strcasecmp(previous, name) != 0) {
+        if (SD.exists(retired)) SD.remove(retired);
+        SD.rename(previous, retired);  // best effort: the mount itself already succeeded
+    }
+    sendAck();
+}
+
 void handleOpenWrite(const uint8_t *payload, uint16_t length) {
     if (length != 40) { sendError(ERR_INVALID_LENGTH, CMD_FILE_OPEN_WRITE, "want name+u64"); return; }
     closeTransferFile();
     if (!validName(payload, g.finalName)) { sendError(ERR_FILE_STATE, CMD_FILE_OPEN_WRITE, "bad filename"); return; }
+    if (mountedImageName(g.finalName)) { sendError(ERR_FILE_STATE, CMD_FILE_OPEN_WRITE, "image mounted; upload a new filename"); return; }
     snprintf(g.partName, sizeof(g.partName), "%s.part", g.finalName);
     if (SD.exists(g.partName)) SD.remove(g.partName);
     g.file = SD.open(g.partName, O_CREAT | O_TRUNC | O_RDWR);
@@ -552,8 +811,44 @@ void handleWrite(const uint8_t *payload, uint16_t length) {
     sendAck();
 }
 
+void handleFileBulkWrite(const uint8_t *payload, uint16_t length) {
+    if (length != 4) { sendError(ERR_INVALID_LENGTH, CMD_FILE_BULK_WRITE, "want byte count"); return; }
+    if (!g.writing || !g.file.isOpen() || g_bulk.active || g_fileBulk.active) {
+        sendError(ERR_FILE_STATE, CMD_FILE_BULK_WRITE, "no write open or stream busy"); return;
+    }
+    const uint32_t bytes = read32(payload);
+    if (bytes != g.expectedSize || !g.file.seekSet(0)) {
+        sendError(ERR_FILE_STATE, CMD_FILE_BULK_WRITE, "stream must cover the whole file"); return;
+    }
+    {
+        CoreMutex mutex(&USB.mutex, false);
+        if (mutex) { tud_task(); tud_vendor_read_flush(); }
+    }
+    g_fileBulk = FileBulkState{};
+    g_fileBulk.active = true;
+    g_fileBulk.expectedBytes = bytes;
+    sendAck();
+}
+
 void handleCommit() {
     if (!g.writing || !g.file.isOpen()) { sendError(ERR_FILE_STATE, CMD_FILE_CLOSE_COMMIT, "no write open"); return; }
+    if (g_fileBulk.active) {
+        // The host queues COMMIT right after its last bulk write; the tail of
+        // the stream may still be in the USB FIFO. Drain it, giving up after
+        // two seconds without progress.
+        uint32_t lastProgress = millis(), lastBytes = g_fileBulk.receivedBytes;
+        while (!g_fileBulk.failed && g_fileBulk.receivedBytes < g_fileBulk.expectedBytes) {
+            pumpVendorFileWrite();
+            if (g_fileBulk.receivedBytes != lastBytes) { lastBytes = g_fileBulk.receivedBytes; lastProgress = millis(); }
+            else if (uint32_t(millis() - lastProgress) > 2000) break;
+        }
+        const bool complete = !g_fileBulk.failed && g_fileBulk.receivedBytes == g_fileBulk.expectedBytes;
+        g_fileBulk = FileBulkState{};
+        if (!complete) {
+            g.file.close(); g.writing = false; SD.remove(g.partName);
+            sendError(ERR_SD_WRITE, CMD_FILE_CLOSE_COMMIT, "bulk stream incomplete"); return;
+        }
+    }
     g.file.flush(); uint64_t actual = g.file.fileSize(); g.file.close(); g.writing = false;
     if (actual != g.expectedSize) { SD.remove(g.partName); sendError(ERR_SD_WRITE, CMD_FILE_CLOSE_COMMIT, "size mismatch"); return; }
     if (SD.exists(g.finalName) && !SD.remove(g.finalName)) { sendError(ERR_SD_WRITE, CMD_FILE_CLOSE_COMMIT, "replace failed"); return; }
@@ -581,6 +876,113 @@ void handleRead(const uint8_t *payload, uint16_t length) {
     int got = g.file.read(out + 6, requested);
     if (got <= 0) { sendError(ERR_SD_READ, CMD_FILE_READ_CHUNK, "read failed"); return; }
     write16(out + 4, got); sendAck(out, got + 6);
+}
+
+// Diagnostic-only opcode: fixed read-only CDBs; never enables a RAM session.
+// Extended request: legacy5 + flags(target-only=1, short-status=2),
+// phase-entry delay u16 LE (0..1000us), REQ/data settle u8 (0..10us).
+void handleReadOnlyInquiryProbe(const uint8_t *payload, uint16_t length) {
+    if (!g_scsi_initiator || g.direct || scsiDev.phase != BUS_FREE) {
+        sendError(ERR_DIRECT_BUSY, 0x5D, "diagnostic bus unavailable"); return;
+    }
+    const bool extended = length == 9;
+    if ((length != 5 && !extended) || payload[0] > 7 || payload[1] > 7 || payload[0] == payload[1] ||
+        payload[2] > 36 || payload[3] > 1 ||
+        (payload[4] != 0x12 && payload[4] != 0x03 && payload[4] != 0x00) ||
+        (payload[4] == 0x00 && payload[2] != 0) ||
+        (extended && ((payload[5] & ~3) || read16(payload + 6) > 1000 || payload[8] > 10 ||
+                      ((payload[5] & 1) && payload[3])))) {
+        sendError(ERR_INVALID_LENGTH, 0x5D, "read-only probe arguments invalid"); return;
+    }
+    g_zbridgeLegacyProbe = {extended, extended && bool(payload[5] & 1),
+        extended && bool(payload[5] & 2), uint16_t(extended ? read16(payload + 6) : 0),
+        uint8_t(extended ? payload[8] : 1)};
+    scsiHostPhyRelease(); scsiInitiatorSetOwnID(payload[1]); g.quiesce = true;
+    uint8_t data[36] = {};
+    uint8_t cdb[6] = {payload[4], 0, 0, 0, payload[2], 0};
+    const uint32_t started = millis();
+    int status = scsiInitiatorRunCommand(payload[0], cdb, 6, data, payload[2],
+        nullptr, 0, false, 1500, true, payload[3] != 0);
+    g_zbridgeLegacyProbe = {false, false, false, 0, 1};
+    uint8_t result[64] = {};
+    if (extended) {
+        memcpy(result, payload, 9);
+        write16(result + 9, (uint16_t)(int16_t)status);
+        result[11] = (uint8_t)g_zbridgeLastReadCount;
+        result[12] = g_scsiInitiatorPhaseHistory;
+        result[13] = g_zbridgeProbeStatus;
+        result[14] = g_zbridgeProbeMessage;
+        result[15] = g_scsiHostPhySelectionStage;
+        write32(result + 16, scsiHostPhyGetSignals());
+        write32(result + 20, scsiHostPhyGetGPIOState());
+        write32(result + 24, millis() - started);
+        memcpy(result + 28, data, 36);
+    } else {
+        memcpy(result, payload, 5);
+        write16(result + 5, (uint16_t)(int16_t)status);
+        result[7] = (uint8_t)g_zbridgeLastReadCount;
+        result[8] = g_scsiInitiatorPhaseHistory;
+        memcpy(result + 9, data, 36);
+    }
+    g.direct = true; restoreTargetMode(); sendAck(result, extended ? 64 : 45);
+}
+
+// Private diagnostic only. Fixed RSTAT request; never opens a RAM session,
+// enables MIDI mode, writes a parameter, or accepts caller-provided MIDI/CDBs.
+// Request: target, initiator, exclusive channel, operation (0=pending,
+// 1=send fixed RSTAT, 2=read pending up to128bytes).
+void handleLegacyStatusProbe(const uint8_t *payload, uint16_t length) {
+    if (!g_scsi_initiator || g.direct || scsiDev.phase != BUS_FREE) {
+        sendError(ERR_DIRECT_BUSY, 0x5E, "diagnostic bus unavailable"); return;
+    }
+    if (length != 4 || payload[0] > 7 || payload[1] > 7 || payload[0] == payload[1] ||
+        payload[2] > 127 || payload[3] > 2) {
+        sendError(ERR_INVALID_LENGTH, 0x5E, "fixed status probe arguments invalid"); return;
+    }
+    scsiHostPhyRelease(); scsiInitiatorSetOwnID(payload[1]); g.quiesce = true;
+    g_zbridgeLegacyProbe = {true, false, false, 0, 1};
+    uint8_t result[144] = {};
+    memcpy(result, payload, 4);
+    uint8_t data[128] = {};
+    uint16_t dataSize = 0;
+    auto execute = [&](uint8_t stage, const uint8_t cdb[6], uint16_t count,
+                       const uint8_t *out = nullptr, uint16_t outCount = 0) {
+        memset(data, 0, sizeof(data));
+        int status = scsiInitiatorRunCommand(payload[0], cdb, 6, count ? data : nullptr,
+            count, out, outCount, false, 1500, true, false);
+        result[4] = stage; write16(result + 5, uint16_t(int16_t(status)));
+        dataSize = count ? uint16_t(g_zbridgeLastReadCount) : 0;
+        if (dataSize > sizeof(data)) dataSize = sizeof(data);
+        write16(result + 7, dataSize);
+        result[9] = g_scsiInitiatorPhaseHistory;
+        result[10] = g_zbridgeProbeStatus; result[11] = g_zbridgeProbeMessage;
+        return status;
+    };
+    const uint8_t inquiry[6] = {0x12, 0, 0, 0, 9, 0};
+    const uint8_t observedLegacy[9] = {0xC7,0,0,0,4,0,0x48,4,0x28};
+    bool legacy = execute(0, inquiry, 9) == 0 && dataSize == 9 &&
+        result[10] == 0 && result[11] == 0 &&
+        memcmp(data, observedLegacy, 9) == 0;
+    if (legacy) {
+        if (payload[3] == 1) {
+            const uint8_t cdb[6] = {0x0C,0,0,0,6,0};
+            const uint8_t rstat[6] = {0xF0,0x47,payload[2],0,0x48,0xF7};
+            execute(2, cdb, 0, rstat, sizeof(rstat));
+        } else {
+            const uint8_t pendingCDB[6] = {0x0D,0,0,0,0,0};
+            if (execute(1, pendingCDB, 3) == 0 && dataSize == 3) {
+                uint32_t pending = (uint32_t(data[0]) << 16) | (uint32_t(data[1]) << 8) | data[2];
+                write32(result + 12, pending);
+                if (payload[3] == 2 && pending > 0 && pending <= sizeof(data)) {
+                    const uint8_t cdb[6] = {0x0E,0,0,uint8_t(pending >> 8),uint8_t(pending),0};
+                    execute(3, cdb, uint16_t(pending));
+                }
+            }
+        }
+    }
+    memcpy(result + 16, data, dataSize);
+    g_zbridgeLegacyProbe = {false, false, false, 0, 1};
+    g.direct = true; restoreTargetMode(); sendAck(result, 16 + dataSize);
 }
 
 void handleDiscovery(const uint8_t *payload, uint16_t length) {
@@ -611,7 +1013,14 @@ void handleDiscovery(const uint8_t *payload, uint16_t length) {
                  (unsigned long)g.fallbackGPIOState);
         sendError(ERR_TIMEOUT, CMD_AKAI_DISCOVER, detail); return;
     }
-    if (lastResult == INITIATOR_TRANSPORT_ERROR) { sendError(ERR_SCSI_COMMAND, CMD_AKAI_DISCOVER, "SCSI inquiry transport failed"); return; }
+    if (lastResult == INITIATOR_TRANSPORT_ERROR) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "INQ status%d read%lu phase%02X hdr%02X%02X%02X%02X%02X%02X%02X%02X",
+                 g.lastInquiryStatus, (unsigned long)g.lastInquiryReadCount, g.lastInquiryPhase,
+                 g.lastInquiryPrefix[0], g.lastInquiryPrefix[1], g.lastInquiryPrefix[2], g.lastInquiryPrefix[3],
+                 g.lastInquiryPrefix[4], g.lastInquiryPrefix[5], g.lastInquiryPrefix[6], g.lastInquiryPrefix[7]);
+        sendError(ERR_SCSI_COMMAND, CMD_AKAI_DISCOVER, detail); return;
+    }
     if (lastResult == INITIATOR_NOT_AKAI) { sendError(ERR_AKAI_NOT_FOUND, CMD_AKAI_DISCOVER, "SCSI target is not an Akai processor"); return; }
     char detail[64];
     snprintf(detail, sizeof(detail), "no BSY; S s%u x%06lX; L s%u x%06lX",
@@ -663,15 +1072,22 @@ void handleSCSIExecute(const uint8_t *payload, uint16_t length) {
     uint8_t *in = direction == 2 ? g.body + 8 : nullptr;
     int status = scsiInitiatorRunCommand(g.directTarget, cdb, cdbLength,
         in, direction == 2 ? readLength : 0, direction == 1 ? out : nullptr,
-        direction == 1 ? outLength : 0, false, timeout ? timeout : 10000, true, true);
+        direction == 1 ? outLength : 0, false, timeout ? timeout : 10000, true, !g.legacyAkai);
     if (status == -4) { restoreTargetMode(); sendError(ERR_TIMEOUT, CMD_AKAI_SCSI_EXECUTE, "SCSI command phase timed out"); return; }
-    if (status < 0) { sendError(ERR_SCSI_COMMAND, CMD_AKAI_SCSI_EXECUTE, "SCSI transport failed"); return; }
+    if (status < 0) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "C%02X s%d w%lu/%lu r%lu/%lu ph%02X S%02X M%02X",
+            cdb[0], status, (unsigned long)g_zbridgeLastWriteCount, (unsigned long)outLength,
+            (unsigned long)g_zbridgeLastReadCount, (unsigned long)readLength,
+            g_scsiInitiatorPhaseHistory, g_zbridgeProbeStatus, g_zbridgeProbeMessage);
+        sendError(ERR_SCSI_COMMAND, CMD_AKAI_SCSI_EXECUTE, detail); return;
+    }
     uint8_t sense = 0, asc = 0, ascq = 0;
     if (status == 2) {
         uint8_t senseData[18] = {};
         uint8_t senseCDB[6] = {0x03, 0x00, 0x00, 0x00, sizeof(senseData), 0x00};
         int senseStatus = scsiInitiatorRunCommand(g.directTarget, senseCDB, sizeof(senseCDB),
-            senseData, sizeof(senseData), nullptr, 0, false, 3000, true, true);
+            senseData, g.legacyAkai ? 4 : sizeof(senseData), nullptr, 0, false, 3000, true, !g.legacyAkai);
         if (senseStatus == -4) { restoreTargetMode(); sendError(ERR_TIMEOUT, CMD_AKAI_SCSI_EXECUTE, "SCSI request-sense phase timed out"); return; }
         if (senseStatus == 0) { sense = senseData[2] & 0x0F; asc = senseData[12]; ascq = senseData[13]; }
     }
@@ -759,7 +1175,7 @@ void handleMIDISendBatch(const uint8_t *payload, uint16_t length) {
         };
         const int status = scsiInitiatorRunCommand(
             g.directTarget, cdb, sizeof(cdb), nullptr, 0,
-            event, eventLength, false, 3000, true, true);
+            event, eventLength, false, 3000, true, !g.legacyAkai);
         if (status == -4) {
             restoreTargetMode();
             sendError(ERR_TIMEOUT, CMD_MIDI_SEND_BATCH,
@@ -904,7 +1320,7 @@ void handleBulkBegin(const uint8_t *payload, uint16_t length) {
     const uint32_t started = micros();
     const int status = scsiInitiatorRunCommand(
         g.directTarget, cdb, sizeof(cdb), nullptr, 0,
-        g_bulk.slots[0].data, bytes, false, 30000, true, true);
+        g_bulk.slots[0].data, bytes, false, 30000, true, !g.legacyAkai);
     g_bulk.commandMicros = uint32_t(micros() - started);
     g_bulk.commandRunning = false;
 
@@ -1118,7 +1534,7 @@ void handleBulkReadBegin(const uint8_t *payload, uint16_t length) {
     const uint32_t started = micros();
     int status = scsiInitiatorRunCommand(
         g.directTarget, cdb, sizeof(cdb), g.body + 8, bytes,
-        nullptr, 0, false, 300000, true, true);
+        nullptr, 0, false, 300000, true, !g.legacyAkai);
     g_bulkRead.commandMicros = uint32_t(micros() - started);
     g_bulkRead.commandRunning = false;
 
@@ -1249,6 +1665,8 @@ void dispatch(uint8_t opcode, const uint8_t *payload, uint16_t length) {
         if (length != 1 || g.direct) sendError(g.direct ? ERR_DIRECT_BUSY : ERR_INVALID_LENGTH, opcode, "invalid quiesce");
         else { g.quiesce = payload[0] != 0; sendAck(); }
         break;
+    case CMD_MOUNT_IMAGE: handleMountImage(payload, length); break;
+    case CMD_FILE_BULK_WRITE: handleFileBulkWrite(payload, length); break;
     case CMD_EJECT_CYCLE:
         if (length != 1 || payload[0] >= S2S_MAX_TARGETS) sendError(ERR_IMAGE_INDEX, opcode, "bad scsi id");
         else {
@@ -1269,6 +1687,8 @@ void dispatch(uint8_t opcode, const uint8_t *payload, uint16_t length) {
     case CMD_MIDI_SEND_BATCH: handleMIDISendBatch(payload, length); break;
     case CMD_MIDI_FLUSH: handleMIDIFlush(payload, length); break;
     case CMD_AKAI_DISCOVER: handleDiscovery(payload, length); break;
+    case 0x5D: handleReadOnlyInquiryProbe(payload, length); break;
+    case 0x5E: handleLegacyStatusProbe(payload, length); break;
     case CMD_AKAI_SESSION_BEGIN: handleSessionBegin(payload, length); break;
     case CMD_AKAI_SCSI_EXECUTE: handleSCSIExecute(payload, length); break;
     case CMD_AKAI_BULK_BEGIN: handleBulkBegin(payload, length); break;
@@ -1599,8 +2019,11 @@ bool zbridge_stream_write(const uint8_t *source, uint32_t count) {
 }
 
 bool zbridge_poll() {
-    uint32_t now = millis();
     pumpVendorBenchmark();
+    pumpVendorFileWrite();
+    // Read the clock after the pumps: they advance g.lastActivity, and an
+    // earlier `now` makes now - lastActivity wrap and trip the idle timeout.
+    uint32_t now = millis();
     if (g.direct && uint32_t(now - g.lastActivity) > DIRECT_IDLE_MS) restoreTargetMode();
     if (g.binary && !g.direct && uint32_t(now - g.lastActivity) > BINARY_IDLE_MS) {
         closeTransferFile(); g.quiesce = false; g.binary = false; resetParser();
@@ -1609,6 +2032,7 @@ bool zbridge_poll() {
     if (!g.binary && Serial.peek() != SYNC0) return false;
     g.binary = true; g.lastActivity = now;
     pumpCDCInput();
+    if (g_mountPending) runPendingMount();
     return true;
 }
 

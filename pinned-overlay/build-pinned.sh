@@ -23,6 +23,7 @@ git -C "$zbridge_build_dir" apply --unidiff-zero "$zbridge_script_dir/patches/00
 git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0007-zbridge-fast-host-read.patch"
 git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0008-zbridge-boot-mode.patch"
 git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0009-zbridge-disk-scan-stack.patch"
+git -C "$zbridge_build_dir" apply "$zbridge_script_dir/patches/0010-zbridge-s1000-live-mount-file-stream.patch"
 cp "$zbridge_script_dir/src/ZBridge.cpp" "$zbridge_build_dir/src/ZBridge.cpp"
 cp "$zbridge_script_dir/src/ZBridge.h" "$zbridge_build_dir/src/ZBridge.h"
 cp "$zbridge_script_dir/src/ZBridgeFastHostWrite.cpp" "$zbridge_build_dir/src/ZBridgeFastHostWrite.cpp"

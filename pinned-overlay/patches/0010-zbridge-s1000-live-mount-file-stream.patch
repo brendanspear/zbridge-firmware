@@ -1,0 +1,357 @@
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+index 96221b6..28a8992 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/ZuluSCSI_platform.cpp
+@@ -1068,12 +1068,12 @@ bool platform_serial_connected()
+ 
+ uint32_t platform_write_to_serial(uint8_t* data, uint32_t len)
+ {
++    if (zbridge_binary_active()) return 0;
+     if (len > 0 && usb_serial_connected() && Serial.availableForWrite())
+     {
+         if (len > CFG_TUD_CDC_EP_BUFSIZE) len = CFG_TUD_CDC_EP_BUFSIZE;
+         return Serial.write(data, len);
+     }
+-    if (zbridge_binary_active()) return 0;
+     return 0;
+ }
+ 
+@@ -1093,9 +1093,9 @@ static void usb_log_poll()
+     static uint32_t logpos = 0;
+ 
+     if (!usb_serial_connected()) return;
++    if (zbridge_binary_active()) return;
+ 
+ #ifdef PLATFORM_MASS_STORAGE
+-    if (zbridge_binary_active()) return;
+     if (platform_msc_lock_get()) return; // Avoid re-entrant USB events
+ #endif
+ 
+@@ -1461,17 +1461,17 @@ void platform_reset_mcu(uint32_t reset_in_ms)
+         watchdog_reboot(0, 0, reset_in_ms);
+ }
+ 
+-const uint8_t* platform_get_8byte_mcu_id()
+-{
+-    static uint8_t mcu_id[8] = {0};
+-    static bool filled = false;
+-    if (!filled)
+ void platform_enter_bootloader(void)
+ {
+     g_uf2_mode = true;
+     platform_reset_mcu(0);
+ }
+ 
++const uint8_t* platform_get_8byte_mcu_id()
++{
++    static uint8_t mcu_id[8] = {0};
++    static bool filled = false;
++    if (!filled)
+     {
+         pico_unique_board_id_t board_id;
+         pico_get_unique_board_id(&board_id);
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+index a098131..e6aeada 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.cpp
+@@ -36,6 +36,8 @@ extern "C" {
+ #include <scsi.h>
+ }
+ 
++ZBridgeLegacyProbeConfig g_zbridgeLegacyProbe = {false, false, false, 0, 1};
++uint32_t g_zbridgeProbeCommandStarted = 0;
+ volatile int g_scsiHostPhyReset;
+ int g_scsiHostBusWidth;
+ uint8_t g_scsiHostPhySelectionStage;
+@@ -231,7 +233,8 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id, bool request_atn)
+                " with initiator ID ", (int)initiator_id);
+         SCSI_OUT(SEL, 1);
+         delayMicroseconds(5);
+-        SCSI_OUT_DATA((1 << target_id) | (1 << initiator_id));
++        SCSI_OUT_DATA((1 << target_id) |
++            ((g_zbridgeLegacyProbe.active && g_zbridgeLegacyProbe.targetOnly) ? 0 : (1 << initiator_id)));
+         delayMicroseconds(5);
+         g_scsiHostPhySelectionStage = 2;
+         SCSI_OUT(BSY, 0);
+@@ -386,13 +389,41 @@ bool scsiHostRequestWaiting()
+   }
+ 
+ // Write one byte to SCSI target using the handshake mechanism
++// Bounded experimental control-byte handshake. Service USB and the watchdog
++// while waiting; a stalled target must not strand the bridge command loop.
++static bool zbridgeWaitForREQ(bool active)
++{
++    if (g_scsiHostPhyReset || (g_zbridgeLegacyProbe.active &&
++        uint32_t(millis() - g_zbridgeProbeCommandStarted) >= 1500)) {
++        g_scsiHostPhyReset = true; SCSI_RELEASE_OUTPUTS(); return false;
++    }
++    const uint32_t started = millis();
++    uint32_t polled = started;
++    while (bool(SCSI_IN(REQ)) != active)
++    {
++        const uint32_t now = millis();
++        if (g_scsiHostPhyReset || uint32_t(now - started) >= 1500 ||
++            (g_zbridgeLegacyProbe.active && uint32_t(now - g_zbridgeProbeCommandStarted) >= 1500))
++        {
++            g_scsiHostPhyReset = true;
++            SCSI_RELEASE_OUTPUTS();
++            return false;
++        }
++        if (uint32_t(now - polled) >= 1)
++        {
++            platform_reset_watchdog(); platform_poll(); polled = now;
++        }
++    }
++    return true;
++}
++
+ static inline void scsiHostWriteOneByte(uint8_t value)
+ {
+-    SCSIHOST_WAIT_ACTIVE(REQ);
++    if (!zbridgeWaitForREQ(true)) return;
+     SCSI_OUT_DATA(value);
+     delay_100ns(); // DB setup time before ACK
+     SCSI_OUT(ACK, 1);
+-    SCSIHOST_WAIT_INACTIVE(REQ);
++    if (!zbridgeWaitForREQ(false)) return;
+     SCSI_RELEASE_DATA_REQ();
+     SCSI_OUT(ACK, 0);
+ }
+@@ -400,10 +431,11 @@ static inline void scsiHostWriteOneByte(uint8_t value)
+ // Read one byte from SCSI target using the handshake mechanism.
+ static inline uint8_t scsiHostReadOneByte(int* parityError)
+ {
+-    SCSIHOST_WAIT_ACTIVE(REQ);
++    if (!zbridgeWaitForREQ(true)) return 0;
++    delayMicroseconds(g_zbridgeLegacyProbe.active ? g_zbridgeLegacyProbe.settleUs : 1); // diagnostic REQ-to-data settle
+     uint32_t r = SCSI_IN_DATA();
+     SCSI_OUT(ACK, 1);
+-    SCSIHOST_WAIT_INACTIVE(REQ);
++    if (!zbridgeWaitForREQ(false)) return 0;
+     SCSI_OUT(ACK, 0);
+ 
+ #ifdef ZULUSCSI_WIDE // wide keeps data signals inverted
+@@ -481,14 +513,11 @@ uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
+ 
+     for (uint32_t i = 0; i < count; i++)
+     {
+-        while (!SCSI_IN(REQ))
++        if (!zbridgeWaitForREQ(true)) return i;
++        if (g_scsiHostPhyReset || SCSI_IN(IO) || SCSI_IN(CD) != cd_start || SCSI_IN(MSG) != msg_start)
+         {
+-            if (g_scsiHostPhyReset || SCSI_IN(IO) || SCSI_IN(CD) != cd_start || SCSI_IN(MSG) != msg_start)
+-            {
+-                // Target switched out of DATA_OUT mode
+-                logmsg("scsiHostWrite: sent ", (int)i, " bytes, expected ", (int)count);
+-                return i;
+-            }
++            logmsg("scsiHostWrite: target changed phase after ", (int)i, " bytes");
++            return i;
+         }
+ 
+         if (g_scsiHostBusWidth == 0)
+@@ -544,7 +573,7 @@ uint32_t scsiHostRead(uint8_t *data, uint32_t count)
+     }
+ #endif
+ 
+-    if ((count & 1) == 0 && ((uint32_t)data & 1) == 0)
++    if (count > 64 && (count & 1) == 0 && ((uint32_t)data & 1) == 0)
+     {
+         // Even number of bytes, use accelerated routine
+         count = scsi_accel_host_read(data, count, parityError, g_scsiHostBusWidth, &g_scsiHostPhyReset);
+@@ -553,11 +582,7 @@ uint32_t scsiHostRead(uint8_t *data, uint32_t count)
+     {
+         for (uint32_t i = 0; i < count; i++)
+         {
+-            uint32_t start = millis();
+-            while (!SCSI_IN(REQ) && (millis() - start) < 10000)
+-            {
+-                // Wait for REQ asserted
+-            }
++            if (!zbridgeWaitForREQ(true)) { count = i; break; }
+ 
+             int io = SCSI_IN(IO);
+             int cd = SCSI_IN(CD);
+@@ -626,7 +651,7 @@ void scsiHostWaitBusFree()
+     // This happens for some reason with READ6 command on IBM H3171-S2.
+     uint32_t start = millis();
+     int extra_bytes = 0;
+-    while (SCSI_IN(BSY))
++    while (SCSI_IN(BSY) && !g_scsiHostPhyReset)
+     {
+         platform_poll();
+ 
+@@ -637,7 +662,7 @@ void scsiHostWaitBusFree()
+              SCSI_OUT(BSY, 1);
+              sleep_us(1);
+ 
+-             while (SCSI_IN(REQ))
++             while (SCSI_IN(REQ) && !g_scsiHostPhyReset && uint32_t(millis() - start) < 1500)
+              {
+                 scsiHostReadOneByte(nullptr);
+                 extra_bytes++;
+@@ -648,7 +673,7 @@ void scsiHostWaitBusFree()
+              sleep_us(1);
+         }
+ 
+-        if ((uint32_t)(millis() - start) > 10000)
++        if ((uint32_t)(millis() - start) > 1500)
+         {
+             logmsg("Target is holding BSY for unexpectedly long, running reset.");
+             scsiHostPhyReset();
+@@ -662,6 +687,7 @@ void scsiHostWaitBusFree()
+     }
+ 
+     scsiHostPhyRelease();
++    if (g_scsiHostPhyReset) scsiHostPhyReset();
+ }
+ 
+ // Release all bus signals
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
+index 7d8aa3c..6aab174 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsiHostPhy.h
+@@ -82,3 +82,16 @@ void scsiHostWaitBusFree();
+ 
+ // Release all bus signals
+ void scsiHostPhyRelease();
++
++// Diagnostic59 only: per-command experiments, never saved or used by sessions.
++typedef struct ZBridgeLegacyProbeConfig {
++    bool active;
++    bool targetOnly;
++    bool allowShort;
++    uint16_t phaseDelayUs;
++    uint8_t settleUs;
++} ZBridgeLegacyProbeConfig;
++extern ZBridgeLegacyProbeConfig g_zbridgeLegacyProbe;
++extern uint32_t g_zbridgeProbeCommandStarted;
++extern uint8_t g_zbridgeProbeStatus;
++extern uint8_t g_zbridgeProbeMessage;
+diff --git a/lib/ZuluSCSI_platform_RP2MCU/scsi_accel_host.cpp b/lib/ZuluSCSI_platform_RP2MCU/scsi_accel_host.cpp
+index 6312f07..0ffb36f 100644
+--- a/lib/ZuluSCSI_platform_RP2MCU/scsi_accel_host.cpp
++++ b/lib/ZuluSCSI_platform_RP2MCU/scsi_accel_host.cpp
+@@ -22,6 +22,9 @@
+ // Accelerated SCSI subroutines for SCSI initiator/host side communication
+ 
+ #include "scsi_accel_host.h"
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++#include "ZBridgeFastHostWrite.h"
++#endif
+ #include "ZuluSCSI_platform.h"
+ #include "ZuluSCSI_log.h"
+ #include <hardware/pio.h>
+@@ -260,6 +263,11 @@ uint32_t scsi_accel_host_read(uint8_t *buf, uint32_t count, int *parityError, in
+ 
+ void scsi_accel_host_init()
+ {
++#if defined(ZBRIDGE_DIRECT_RAM_MODE)
++    // The read program reload below invalidates all other pio0 code. Reset
++    // the cached writer offset before clearing, without leaking its DMA lease.
++    zbridgeFastHostWriteInvalidatePIO();
++#endif
+     g_scsi_host_state = SCSIHOST_IDLE;
+     scsi_accel_host_config_gpio();
+ 
+diff --git a/src/ZuluSCSI_disk.cpp b/src/ZuluSCSI_disk.cpp
+index 9531685..561ab36 100644
+--- a/src/ZuluSCSI_disk.cpp
++++ b/src/ZuluSCSI_disk.cpp
+@@ -784,6 +784,7 @@ bool scsiDiskFilenameValid(const char* name)
+ 	    ".ini", ".mid", ".midi", ".aiff", ".mp3", ".m4a",
+             ".ori", // Kiosk mode original images
+             ".tmp", // COW dirty files (contains only the writes)
++            ".part", // ZBridge upload in progress or interrupted
+ #if ENABLE_COW==0
+             ".cow", // If COW is not enabled, we ignore .cow files
+ #endif
+diff --git a/src/ZuluSCSI_initiator.cpp b/src/ZuluSCSI_initiator.cpp
+index 89e4e4e..501a4bf 100644
+--- a/src/ZuluSCSI_initiator.cpp
++++ b/src/ZuluSCSI_initiator.cpp
+@@ -767,6 +767,11 @@ uint8_t g_scsiInitiatorTimeoutSelectionStage = 0;
+ uint8_t g_scsiInitiatorPhaseHistory = 0;
+ uint32_t g_scsiInitiatorTimeoutGPIOState = 0;
+ 
++uint32_t g_zbridgeLastReadCount = 0;
++uint32_t g_zbridgeLastWriteCount = 0;
++uint8_t g_zbridgeProbeStatus = 0xFF;
++uint8_t g_zbridgeProbeMessage = 0xFF;
++
+ int scsiInitiatorRunCommand(int target_id,
+                             const uint8_t *command, size_t cmdLen,
+                             uint8_t *bufIn, size_t bufInLen,
+@@ -781,6 +786,10 @@ int scsiInitiatorRunCommand(int target_id,
+     g_scsiInitiatorPhaseHistory = 0;
+     g_scsiInitiatorTimeoutGPIOState = 0;
+ 
++    g_zbridgeLastReadCount = 0;
++    g_zbridgeLastWriteCount = 0;
++    g_zbridgeProbeStatus = g_zbridgeProbeMessage = 0xFF;
++
+     // Akai processor targets follow the SCSI-2 initiator sequence used by
+     // MESA/SCSI2Pi: assert ATN during selection, then send IDENTIFY in the
+     // MESSAGE OUT phase before the command. Generic disk callers retain the
+@@ -799,8 +808,10 @@ int scsiInitiatorRunCommand(int target_id,
+     }
+ 
+     SCSI_PHASE phase;
++    int previousProbePhase = -100;
+     int status = -1;
+     uint32_t start = millis();
++    if (g_zbridgeLegacyProbe.active) g_zbridgeProbeCommandStarted = start;
+     while ((phase = (SCSI_PHASE)scsiHostPhyGetPhase()) != BUS_FREE)
+     {
+         uint32_t elapsed = (uint32_t)(millis() - start);
+@@ -833,11 +844,18 @@ int scsiInitiatorRunCommand(int target_id,
+ 
+         platform_poll();
+ 
++        if (g_zbridgeLegacyProbe.active && previousProbePhase != (int)phase) {
++            if (phase == COMMAND || phase == DATA_IN)
++                delayMicroseconds(g_zbridgeLegacyProbe.phaseDelayUs);
++            previousProbePhase = (int)phase;
++        }
++
+         if (phase == MESSAGE_IN)
+         {
+             g_scsiInitiatorPhaseHistory |= 1u << 5;
+             uint8_t msg = 0;
+             scsiHostRead(&msg, 1);
++            g_zbridgeProbeMessage = msg;
+ 
+             if (msg == MSG_COMMAND_COMPLETE)
+             {
+@@ -868,9 +886,13 @@ int scsiInitiatorRunCommand(int target_id,
+             }
+ 
+             scsiHostSetBusWidth(g_initiator_state.targetBusWidth[target_id]);
+-            uint32_t readCount = scsiHostRead(bufIn, bufInLen);
++            const size_t alreadyRead = g_zbridgeLegacyProbe.active ? g_zbridgeLastReadCount : 0;
++            if (alreadyRead >= bufInLen) { status = -3; break; }
++            uint32_t readCount = scsiHostRead(bufIn + alreadyRead, bufInLen - alreadyRead);
++            g_zbridgeLastReadCount = alreadyRead + readCount;
+             scsiHostSetBusWidth(0);
+-            if (readCount != bufInLen)
++            if (g_zbridgeLastReadCount != bufInLen &&
++                !(g_zbridgeLegacyProbe.active && g_zbridgeLegacyProbe.allowShort && !g_scsiHostPhyReset))
+             {
+                 logmsg("scsiHostRead failed, tried to read ", (int)bufInLen, " bytes, got ", (int)readCount);
+                 status = -2;
+@@ -890,6 +912,7 @@ int scsiInitiatorRunCommand(int target_id,
+ 
+             scsiHostSetBusWidth(g_initiator_state.targetBusWidth[target_id]);
+             uint32_t writeCount = scsiHostWrite(bufOut, bufOutLen);
++            g_zbridgeLastWriteCount = writeCount;
+             scsiHostSetBusWidth(0);
+             if (writeCount != bufOutLen)
+             {
+@@ -904,6 +927,7 @@ int scsiInitiatorRunCommand(int target_id,
+             uint8_t tmp = -1;
+             scsiHostRead(&tmp, 1);
+             status = tmp;
++            g_zbridgeProbeStatus = tmp;
+ #ifndef ZULUSCSI_NETWORK
+             dbgmsg("------ STATUS: ", tmp);
+ #endif
